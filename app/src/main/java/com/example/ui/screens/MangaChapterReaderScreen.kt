@@ -7,10 +7,14 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import android.content.Context
+import android.os.BatteryManager
 import android.view.KeyEvent
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -163,32 +167,35 @@ fun MangaChapterReaderScreen(
     }
     val isActivelyDownloading = effectiveDownloadStatus == "DOWNLOADING" || effectiveDownloadStatus == "QUEUED"
 
+    val targetChapterUrl = remember(chapter.chapterUrl, work.siteUrl, work.id, chapter.number) {
+        chapter.chapterUrl.ifBlank {
+            "${work.siteUrl.trimEnd('/')}/series/${work.id}/${chapter.number}"
+        }
+    }
+
     var localPagePaths by remember(chapter.id, chapter.localPagePaths) {
         mutableStateOf(chapter.localPagePaths)
     }
-    var livePageUrls by remember(chapter.id, chapter.chapterUrl, chapter.pageImageUrls) {
-        mutableStateOf(chapter.pageImageUrls)
+    var livePageUrls by remember(chapter.id, targetChapterUrl, chapter.pageImageUrls) {
+        val cached = chapter.pageImageUrls.ifEmpty {
+            LiveMangaSiteScraper.getCachedChapterPages(targetChapterUrl)
+        }
+        mutableStateOf(cached)
     }
     var loadingProgress by remember(chapter.id, isOfflineComplete) {
         mutableIntStateOf(
-            if (isOfflineComplete || chapter.localPagePaths.isNotEmpty() || chapter.pageImageUrls.isNotEmpty()) 100 else 5
+            if (isOfflineComplete || chapter.localPagePaths.isNotEmpty() || livePageUrls.isNotEmpty()) 100 else 12
         )
     }
     var isChapterLoaded by remember(chapter.id, isOfflineComplete) {
         mutableStateOf(
-            isOfflineComplete || chapter.localPagePaths.isNotEmpty() || chapter.pageImageUrls.isNotEmpty()
+            isOfflineComplete || chapter.localPagePaths.isNotEmpty() || livePageUrls.isNotEmpty()
         )
     }
     var requiresCloudflare by remember(chapter.id, chapter.chapterUrl) { mutableStateOf(false) }
     var lastScrapeError by remember(chapter.id) { mutableStateOf<String?>(null) }
     var showProtectionModal by remember { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
-
-    val targetChapterUrl = remember(chapter.chapterUrl, work.siteUrl, work.id, chapter.number) {
-        chapter.chapterUrl.ifBlank {
-            "${work.siteUrl.trimEnd('/')}/series/${work.id}/${chapter.number}"
-        }
-    }
 
     // Only fetch from network if NOT reading a completed local chapter (100% offline support in Airplane mode!)
     LaunchedEffect(chapter.id, targetChapterUrl, isOfflineComplete, refreshTrigger) {
@@ -198,17 +205,24 @@ fun MangaChapterReaderScreen(
             return@LaunchedEffect
         }
         if ((livePageUrls.isEmpty() && localPagePaths.isEmpty()) || refreshTrigger > 0) {
-            if (localPagePaths.isEmpty()) {
+            if (localPagePaths.isEmpty() && livePageUrls.isEmpty()) {
                 isChapterLoaded = false
                 loadingProgress = 12
+                // Smooth progress animation towards "إنتظر..." while OkHttp resolves chapter images
+                launch {
+                    delay(180)
+                    if (!isChapterLoaded && loadingProgress < 45) loadingProgress = 42
+                    delay(320)
+                    if (!isChapterLoaded && loadingProgress < 75) loadingProgress = 72
+                }
             }
             val res = LiveMangaSiteScraper.fetchChapterPages(work, chapter.copy(chapterUrl = targetChapterUrl))
-            loadingProgress = 68
+            loadingProgress = 85
             if (res.pageUrls.isNotEmpty()) {
-                // Keep whichever list has more pages so we never regress to 1 page
                 if (res.pageUrls.size >= livePageUrls.size) {
                     livePageUrls = res.pageUrls
                 }
+                LiveMangaSiteScraper.cacheChapterPages(targetChapterUrl, res.pageUrls)
                 requiresCloudflare = false
                 lastScrapeError = null
                 loadingProgress = 100
@@ -221,14 +235,14 @@ fun MangaChapterReaderScreen(
             } else {
                 lastScrapeError = res.errorMessage
                 loadingProgress = 97
-                delay(250)
+                delay(200)
                 isChapterLoaded = true
             }
         }
     }
 
-    // Hidden WebView DOM Bridge only when pages were not already resolved by OkHttp/cache
-    if ((!isOfflineComplete && targetChapterUrl.startsWith("http") && livePageUrls.isEmpty() && localPagePaths.isEmpty()) || refreshTrigger > 0) {
+    // Hidden WebView DOM Bridge ONLY after OkHttp finished with 0 pages or on manual retry (avoids main-thread WebView stutter!)
+    if ((!isOfflineComplete && targetChapterUrl.startsWith("http") && isChapterLoaded && livePageUrls.isEmpty() && localPagePaths.isEmpty()) || refreshTrigger > 0) {
         HiddenSiteWebViewBridge(
             targetUrl = targetChapterUrl,
             jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CHAPTER_PAGES,
@@ -239,6 +253,7 @@ fun MangaChapterReaderScreen(
                     if (domRes.pageUrls.size > livePageUrls.size) {
                         livePageUrls = domRes.pageUrls
                     }
+                    LiveMangaSiteScraper.cacheChapterPages(targetChapterUrl, domRes.pageUrls)
                     requiresCloudflare = false
                     lastScrapeError = null
                     loadingProgress = 100
@@ -260,7 +275,8 @@ fun MangaChapterReaderScreen(
     }
     val totalPages = effectivePageCount.coerceAtLeast(1)
 
-    var showReaderHud by remember { mutableStateOf(true) }
+    // Immersive entry (HUD hidden initially like Video 00:21-00:28, shown on center tap like 00:29)
+    var showReaderHud by remember { mutableStateOf(false) }
     var showQuickTunePopup by remember { mutableStateOf(false) }
     var showCommentsDialog by remember { mutableStateOf(false) }
     var showPagesGridDialog by remember { mutableStateOf(false) }
@@ -327,24 +343,32 @@ fun MangaChapterReaderScreen(
         }
     }
 
-    // Active lookahead prefetcher: preloads previous 1 + current + next 5 pages in background so scrolling has zero lag
+    // Active lookahead prefetcher: preloads previous 1 + current + next 8 pages in background with exact cache keys so scrolling is 120fps butter-smooth
     LaunchedEffect(currentPageIndex, livePageUrls) {
         if (livePageUrls.isNotEmpty() && !isOfflineComplete) {
             val loader = com.example.ui.components.MangaCoilImageLoader.get(readerContext)
-            val referer = targetChapterUrl.ifBlank { work.siteUrl }
+            val referer = targetChapterUrl.ifBlank { work.mangaUrl.ifBlank { work.siteUrl } }
             val startIdx = (currentPageIndex - 1).coerceAtLeast(0)
-            val endIdx = (currentPageIndex + 5).coerceAtMost(livePageUrls.lastIndex)
+            val endIdx = (currentPageIndex + 8).coerceAtMost(livePageUrls.lastIndex)
             for (idx in startIdx..endIdx) {
-                val url = livePageUrls.getOrNull(idx) ?: continue
+                val url = livePageUrls.getOrNull(idx)?.trim() ?: continue
                 if (url.startsWith("http")) {
-                    val req = coil.request.ImageRequest.Builder(readerContext)
+                    val cookie = LiveMangaSiteScraper.getCombinedCookies(
+                        targetUrl = url,
+                        refererUrl = referer,
+                        siteUrl = work.siteUrl
+                    )
+                    val reqBuilder = coil.request.ImageRequest.Builder(readerContext)
                         .data(url)
-                        .setHeader("Referer", referer)
-                        .setHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent.replace("; wv", ""))
+                        .crossfade(false)
+                        .addHeader("Referer", referer)
+                        .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent.replace("; wv", ""))
                         .memoryCacheKey(url)
                         .diskCacheKey(url)
-                        .build()
-                    loader.enqueue(req)
+                    if (cookie.isNotBlank()) {
+                        reqBuilder.addHeader("Cookie", cookie)
+                    }
+                    loader.enqueue(reqBuilder.build())
                 }
             }
         }
@@ -544,18 +568,35 @@ fun MangaChapterReaderScreen(
             }
             .pointerInput(settings.webtoonZoom) {
                 if (settings.webtoonZoom) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        val newScale = (zoomScale * zoom).coerceIn(1f, 3.5f)
-                        zoomScale = newScale
-                        if (newScale > 1.02f) {
-                            val maxPanX = (size.width * (newScale - 1f)) / 2f
-                            val maxPanY = (size.height * (newScale - 1f)) / 2f
-                            zoomOffsetX = (zoomOffsetX + pan.x).coerceIn(-maxPanX, maxPanX)
-                            zoomOffsetY = (zoomOffsetY + pan.y).coerceIn(-maxPanY, maxPanY)
-                        } else {
-                            zoomOffsetX = 0f
-                            zoomOffsetY = 0f
-                        }
+                    // Only intercept when 2+ fingers are pinching OR when already zoomed in (>1.01f),
+                    // so 1-finger vertical scrolling uses 100% native LazyColumn fling with zero gesture conflict!
+                    awaitEachGesture {
+                        do {
+                            val event = awaitPointerEvent()
+                            val pressedCount = event.changes.count { it.pressed }
+                            if (pressedCount >= 2 || zoomScale > 1.01f) {
+                                val zoomChange = event.calculateZoom()
+                                val panChange = event.calculatePan()
+                                if (zoomChange != 1f || panChange != Offset.Zero) {
+                                    val newScale = (zoomScale * zoomChange).coerceIn(1f, 3.5f)
+                                    zoomScale = newScale
+                                    if (newScale > 1.01f) {
+                                        val maxPanX = (size.width * (newScale - 1f)) / 2f
+                                        val maxPanY = (size.height * (newScale - 1f)) / 2f
+                                        zoomOffsetX = (zoomOffsetX + panChange.x).coerceIn(-maxPanX, maxPanX)
+                                        zoomOffsetY = (zoomOffsetY + panChange.y).coerceIn(-maxPanY, maxPanY)
+                                    } else {
+                                        zoomOffsetX = 0f
+                                        zoomOffsetY = 0f
+                                    }
+                                    event.changes.forEach { change ->
+                                        if (change.position != change.previousPosition) {
+                                            change.consume()
+                                        }
+                                    }
+                                }
+                            }
+                        } while (event.changes.any { it.pressed })
                     }
                 }
             }
@@ -563,24 +604,24 @@ fun MangaChapterReaderScreen(
     ) {
         // ==================== MAIN READER AREA (OFFLINE LOCAL FILES OR LIVE CHAPTER PAGES) ====================
         if (!isChapterLoaded) {
-            // Exact Reader Loading Screen from Video (00:40 - 00:45):
-            // Black background + "جار التحميل..." then "التحميل: X٪" with horizontal progress bar
+            // Exact Reader Loading Screen from Video (00:21 - 00:22):
+            // Black background + "جار التحميل..." then "إنتظر..." with horizontal progress bar
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        text = if (loadingProgress <= 15) {
+                        text = if (loadingProgress <= 25) {
                             "جار التحميل..."
                         } else {
-                            "التحميل: ${MainViewModel.toArabicDigits(loadingProgress.toString())}٪"
+                            "إنتظر..."
                         },
                         color = TextPrimaryWhite,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Medium
                     )
-                    if (loadingProgress > 15) {
+                    if (loadingProgress > 25) {
                         Spacer(modifier = Modifier.height(10.dp))
                         LinearProgressIndicator(
                             progress = { loadingProgress / 100f },
@@ -1693,27 +1734,45 @@ fun MangaChapterReaderScreen(
                 }
             }
 
-            // Bottom Mini Status Strip: Page "١/١٢" in Center
+            // Bottom Mini Status Strip from Video (00:21 - 00:30):
+            // Left: Battery "49%" | Center: Page "١/٣٤" | Right: Time "١١:١٠ ص"
+            val batteryPercent = remember(currentPageIndex) {
+                try {
+                    val bm = readerContext.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+                    val cap = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+                    if (cap in 1..100) cap else 85
+                } catch (_: Throwable) {
+                    85
+                }
+            }
+            val currentTimeText = remember(currentPageIndex) {
+                try {
+                    val sdf = java.text.SimpleDateFormat("hh:mm a", java.util.Locale("ar"))
+                    MainViewModel.toArabicDigits(sdf.format(java.util.Date()))
+                } catch (_: Throwable) {
+                    ""
+                }
+            }
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color(0xCC0A0C12))
-                        .padding(horizontal = 12.dp, vertical = 2.dp),
+                        .background(Color(0x99000000))
+                        .padding(horizontal = 14.dp, vertical = 2.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = if (isOfflineComplete) "OFFLINE" else "ONLINE",
-                        color = if (isOfflineComplete) Color(0xFF81C784) else TextSecondaryGrey,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold
+                        text = "$batteryPercent%",
+                        color = TextPrimaryWhite,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold
                     )
                     if (settings.showPageNumber) {
                         val curAr = MainViewModel.toArabicDigits((currentPageIndex + 1).toString())
                         val totAr = MainViewModel.toArabicDigits(totalPages.toString())
                         Text(
-                            text = "$curAr / $totAr",
+                            text = "$curAr/$totAr",
                             color = TextPrimaryWhite,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
@@ -1723,10 +1782,10 @@ fun MangaChapterReaderScreen(
                         Spacer(modifier = Modifier.width(1.dp))
                     }
                     Text(
-                        text = "الفصل ${MainViewModel.toArabicDigits(chapter.number.toString())}",
+                        text = currentTimeText,
                         color = TextPrimaryWhite,
                         fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }

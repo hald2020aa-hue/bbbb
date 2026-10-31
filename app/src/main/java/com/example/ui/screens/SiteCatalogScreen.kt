@@ -1,5 +1,11 @@
 package com.example.ui.screens
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -25,6 +31,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -70,6 +77,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -144,8 +152,14 @@ fun SiteCatalogScreen(
     // Long-press save manga dialog (02:21 - 02:34)
     var pendingSaveWork by remember { mutableStateOf<MangaWork?>(null) }
 
-    var liveWorks by remember(site.id, site.url) { mutableStateOf(works) }
-    var isLoadingCatalog by remember(site.id, site.url) { mutableStateOf(true) }
+    var liveWorks by remember(site.id, site.url) {
+        mutableStateOf(LiveMangaSiteScraper.getCachedCatalogWorks(site.id).ifEmpty { works })
+    }
+    var isLoadingCatalog by remember(site.id, site.url) {
+        mutableStateOf(LiveMangaSiteScraper.getCachedCatalogWorks(site.id).isEmpty() && works.isEmpty())
+    }
+    var isLoadingMoreCatalog by remember(site.id, site.url) { mutableStateOf(false) }
+    var hasMoreCatalogPages by remember(site.id, site.url) { mutableStateOf(true) }
     var requiresCloudflare by remember(site.id, site.url) { mutableStateOf(false) }
     var errorMessage by remember(site.id, site.url) { mutableStateOf<String?>(null) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
@@ -165,40 +179,73 @@ fun SiteCatalogScreen(
         }
     }
 
-    val targetCatalogUrl = remember(site.url, submittedSearchQuery, selectedGenre, currentPageNumber) {
-        val base = LiveMangaSiteScraper.buildCatalogTargetUrl(
-            site = site,
-            searchQuery = submittedSearchQuery,
-            selectedGenre = selectedGenre
-        )
-        if (currentPageNumber > 1 && !base.contains("page=")) {
-            if (base.contains("?")) "$base&page=$currentPageNumber" else "${base.trimEnd('/')}/page/$currentPageNumber/"
-        } else {
-            base
-        }
+    LaunchedEffect(submittedSearchQuery, selectedGenre) {
+        currentPageNumber = 1
+        hasMoreCatalogPages = true
     }
 
-    // Fetch live manga list directly from the added website
+    val targetCatalogUrl = remember(site.url, submittedSearchQuery, selectedGenre, currentPageNumber, sortMode) {
+        LiveMangaSiteScraper.buildCatalogTargetUrl(
+            site = site,
+            searchQuery = submittedSearchQuery,
+            selectedGenre = selectedGenre,
+            page = currentPageNumber,
+            sortMode = sortMode
+        )
+    }
+
+    // Fetch live manga list (Latest Updates by default) directly from the added website
     LaunchedEffect(site.id, site.url, submittedSearchQuery, selectedGenre, currentPageNumber, refreshTrigger) {
-        isLoadingCatalog = true
+        if (currentPageNumber == 1) {
+            if (liveWorks.isEmpty() || refreshTrigger > 0 || submittedSearchQuery.isNotBlank() || selectedGenre != null) {
+                isLoadingCatalog = true
+            }
+        } else {
+            isLoadingMoreCatalog = true
+        }
         errorMessage = null
         val result = LiveMangaSiteScraper.fetchSiteCatalog(
             site = site,
             searchQuery = submittedSearchQuery,
-            selectedGenre = selectedGenre
+            selectedGenre = selectedGenre,
+            page = currentPageNumber,
+            sortMode = sortMode
         )
         if (result.works.isNotEmpty()) {
-            liveWorks = result.works
+            val previousSize = liveWorks.size
+            liveWorks = if (currentPageNumber == 1) {
+                result.works
+            } else {
+                (liveWorks + result.works).distinctBy { it.mangaUrl.ifBlank { it.id } }
+            }
+            hasMoreCatalogPages = currentPageNumber == 1 || (liveWorks.size > previousSize && result.works.size >= 4)
             requiresCloudflare = false
             isLoadingCatalog = false
+            isLoadingMoreCatalog = false
+
+            // Background prefetch of top 4 works' details on page 1 so tapping a manga opens in 0ms with all chapters ready
+            if (currentPageNumber == 1) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    result.works.take(4).forEach { w ->
+                        if (w.mangaUrl.startsWith("http")) {
+                            runCatching { LiveMangaSiteScraper.fetchMangaDetails(w) }
+                        }
+                    }
+                }
+            }
         } else if (result.requiresCloudflare) {
             requiresCloudflare = true
             errorMessage = result.errorMessage
             isLoadingCatalog = false
+            isLoadingMoreCatalog = false
         } else {
-            errorMessage = result.errorMessage
-            kotlinx.coroutines.delay(1400)
+            if (currentPageNumber > 1) {
+                hasMoreCatalogPages = false
+            } else {
+                errorMessage = result.errorMessage
+            }
             isLoadingCatalog = false
+            isLoadingMoreCatalog = false
         }
     }
 
@@ -235,68 +282,79 @@ fun SiteCatalogScreen(
         isLoadingSiteUpdates = false
     }
 
-    // Background WebView DOM extractor for JS-rendered or Cloudflare-cookie sites (handles both CATALOG and UPDATES tabs)
-    HiddenSiteWebViewBridge(
-        targetUrl = if (activeSectionTab == "UPDATES") site.url else targetCatalogUrl,
-        jsExtractorScript = if (activeSectionTab == "UPDATES" && siteLatestUpdates.isEmpty()) {
-            LiveMangaSiteScraper.JS_EXTRACT_LATEST_UPDATES
-        } else {
-            LiveMangaSiteScraper.JS_EXTRACT_CATALOG
-        },
-        reloadTrigger = refreshTrigger + siteUpdatesRefreshTrigger + (if (activeSectionTab == "UPDATES") 100 else 0),
-        onResultJson = { rawJson ->
-            if (activeSectionTab == "UPDATES" && siteLatestUpdates.isEmpty()) {
-                val domUpdates = LiveMangaSiteScraper.parseLatestUpdatesFromDomJson(rawJson, site)
-                if (domUpdates.updates.isNotEmpty()) {
-                    siteLatestUpdates = domUpdates.updates
-                    siteUpdatesError = null
-                    siteUpdatesShowingCachedOffline = false
-                    isLoadingSiteUpdates = false
-                    onCacheSiteUpdates(domUpdates.updates)
-                }
-            }
-            val domResult = LiveMangaSiteScraper.parseCatalogFromDomJson(rawJson, site)
-            if (domResult.works.isNotEmpty()) {
-                liveWorks = domResult.works
-                requiresCloudflare = false
-                errorMessage = null
-                isLoadingCatalog = false
-                if (siteLatestUpdates.isEmpty()) {
-                    val now = System.currentTimeMillis()
-                    val fallbackUpdates = domResult.works.mapIndexed { idx, w ->
-                        com.example.data.MangaLatestUpdateItem(
-                            updateKey = "${site.id}_${w.id}_latest_$idx",
-                            sourceId = site.id,
-                            sourceName = site.name,
-                            sourceUrl = site.url,
-                            siteIconKey = site.iconKey,
-                            workId = w.id,
-                            workTitle = w.title,
-                            mangaUrl = w.mangaUrl,
-                            coverImageUrl = w.effectiveCoverUrl,
-                            chapterId = "${w.id}_ch_1",
-                            chapterTitle = "أحدث فصل",
-                            chapterNumber = 1,
-                            chapterNumberValue = 1.0,
-                            chapterNumberLabel = "1",
-                            chapterUrl = w.mangaUrl,
-                            publishDateText = "حديثاً",
-                            publishedAtEpochMillis = now - idx * 60_000L,
-                            isDateAvailable = true,
-                            originalOrderIndex = idx,
-                            syncedAt = now
-                        )
+    // Only mount HiddenSiteWebViewBridge when OkHttp scraping finished with 0 results or manual refresh was requested
+    val shouldMountWebViewFallback = (!isLoadingCatalog && liveWorks.isEmpty()) ||
+        (activeSectionTab == "UPDATES" && !isLoadingSiteUpdates && siteLatestUpdates.isEmpty()) ||
+        refreshTrigger > 0
+    if (shouldMountWebViewFallback) {
+        HiddenSiteWebViewBridge(
+            targetUrl = if (activeSectionTab == "UPDATES") site.url else targetCatalogUrl,
+            jsExtractorScript = if (activeSectionTab == "UPDATES" && siteLatestUpdates.isEmpty()) {
+                LiveMangaSiteScraper.JS_EXTRACT_LATEST_UPDATES
+            } else {
+                LiveMangaSiteScraper.JS_EXTRACT_CATALOG
+            },
+            reloadTrigger = refreshTrigger + siteUpdatesRefreshTrigger + (if (activeSectionTab == "UPDATES") 100 else 0),
+            onResultJson = { rawJson ->
+                if (activeSectionTab == "UPDATES" && siteLatestUpdates.isEmpty()) {
+                    val domUpdates = LiveMangaSiteScraper.parseLatestUpdatesFromDomJson(rawJson, site)
+                    if (domUpdates.updates.isNotEmpty()) {
+                        siteLatestUpdates = domUpdates.updates
+                        siteUpdatesError = null
+                        siteUpdatesShowingCachedOffline = false
+                        isLoadingSiteUpdates = false
+                        onCacheSiteUpdates(domUpdates.updates)
                     }
-                    siteLatestUpdates = fallbackUpdates
-                    siteUpdatesError = null
-                    isLoadingSiteUpdates = false
                 }
-            } else if (domResult.requiresCloudflare && liveWorks.isEmpty()) {
-                requiresCloudflare = true
-                isLoadingCatalog = false
+                val domResult = LiveMangaSiteScraper.parseCatalogFromDomJson(rawJson, site)
+                if (domResult.works.isNotEmpty()) {
+                    liveWorks = if (currentPageNumber == 1) {
+                        domResult.works
+                    } else {
+                        (liveWorks + domResult.works).distinctBy { it.mangaUrl.ifBlank { it.id } }
+                    }
+                    requiresCloudflare = false
+                    errorMessage = null
+                    isLoadingCatalog = false
+                    isLoadingMoreCatalog = false
+                    if (siteLatestUpdates.isEmpty()) {
+                        val now = System.currentTimeMillis()
+                        val fallbackUpdates = domResult.works.mapIndexed { idx, w ->
+                            com.example.data.MangaLatestUpdateItem(
+                                updateKey = "${site.id}_${w.id}_latest_$idx",
+                                sourceId = site.id,
+                                sourceName = site.name,
+                                sourceUrl = site.url,
+                                siteIconKey = site.iconKey,
+                                workId = w.id,
+                                workTitle = w.title,
+                                mangaUrl = w.mangaUrl,
+                                coverImageUrl = w.effectiveCoverUrl,
+                                chapterId = "${w.id}_ch_1",
+                                chapterTitle = "أحدث فصل",
+                                chapterNumber = 1,
+                                chapterNumberValue = 1.0,
+                                chapterNumberLabel = "1",
+                                chapterUrl = w.mangaUrl,
+                                publishDateText = "حديثاً",
+                                publishedAtEpochMillis = now - idx * 60_000L,
+                                isDateAvailable = true,
+                                originalOrderIndex = idx,
+                                syncedAt = now
+                            )
+                        }
+                        siteLatestUpdates = fallbackUpdates
+                        siteUpdatesError = null
+                        isLoadingSiteUpdates = false
+                    }
+                } else if (domResult.requiresCloudflare && liveWorks.isEmpty()) {
+                    requiresCloudflare = true
+                    isLoadingCatalog = false
+                    isLoadingMoreCatalog = false
+                }
             }
-        }
-    )
+        )
+    }
 
     // Ensure that if liveWorks loaded first and the user switches to آخر التحديثات while siteLatestUpdates is still empty, it immediately populates from liveWorks
     LaunchedEffect(activeSectionTab, liveWorks, isLoadingSiteUpdates) {
@@ -765,11 +823,29 @@ fun SiteCatalogScreen(
 
             // Content Area
             if (isLoadingCatalog && displayedWorks.isEmpty()) {
-                Column(
+                // Exact centered rotating Refresh icon while loading latest manga from site (Video 00:05 - 00:06)
+                val infiniteTransition = rememberInfiniteTransition(label = "catalog_refresh_spin")
+                val spinAngle by infiniteTransition.animateFloat(
+                    initialValue = 0f,
+                    targetValue = 360f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(durationMillis = 850, easing = LinearEasing),
+                        repeatMode = RepeatMode.Restart
+                    ),
+                    label = "catalog_spin_angle"
+                )
+                Box(
                     modifier = Modifier.fillMaxSize(),
-                    horizontalAlignment = Alignment.CenterHorizontally
+                    contentAlignment = Alignment.Center
                 ) {
-                    ShimmerCatalogGrid(itemCount = 6)
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "جاري التحميل",
+                        tint = TextPrimaryWhite,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .rotate(spinAngle)
+                    )
                 }
             } else if (displayedWorks.isEmpty()) {
                 Box(
@@ -921,6 +997,11 @@ fun SiteCatalogScreen(
                 ) {
                     items(displayedWorks.size, key = { idx -> "${displayedWorks[idx].id}_$idx" }) { index ->
                         val work = displayedWorks[index]
+                        if (index >= displayedWorks.size - 4 && hasMoreCatalogPages && !isLoadingCatalog && !isLoadingMoreCatalog && searchQuery.isBlank()) {
+                            LaunchedEffect(displayedWorks.size) {
+                                currentPageNumber++
+                            }
+                        }
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -954,6 +1035,22 @@ fun SiteCatalogScreen(
                                     fontSize = 10.sp,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                    if (isLoadingMoreCatalog) {
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 16.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CircularProgressIndicator(
+                                    color = PeriwinklePrimary,
+                                    strokeWidth = 2.5.dp,
+                                    modifier = Modifier.size(28.dp)
                                 )
                             }
                         }

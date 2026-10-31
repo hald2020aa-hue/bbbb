@@ -157,11 +157,23 @@ fun MangaDetailsScreen(
         targetMangaUrl.startsWith("http://", ignoreCase = true) || targetMangaUrl.startsWith("https://", ignoreCase = true)
     }
 
+    val detailsContext = androidx.compose.ui.platform.LocalContext.current
+
     var liveWork by remember(work.id, work.mangaUrl, work.chapters.size, work.storageSizeBytes) {
-        mutableStateOf(work)
+        val cached = LiveMangaSiteScraper.getCachedWorkDetails(work.id, targetMangaUrl)
+        val initialWork = if (work.chapters.isEmpty() && cached != null && cached.chapters.isNotEmpty()) {
+            cached.copy(
+                localCoverPath = work.localCoverPath.ifBlank { cached.localCoverPath },
+                isFromLocalStorage = work.isFromLocalStorage,
+                storageSizeBytes = maxOf(work.storageSizeBytes, cached.storageSizeBytes)
+            )
+        } else {
+            work
+        }
+        mutableStateOf(initialWork)
     }
     var isLoadingChapters by remember(work.id, targetMangaUrl) {
-        mutableStateOf(work.chapters.isEmpty() && hasValidRemoteUrl)
+        mutableStateOf(liveWork.chapters.isEmpty() && hasValidRemoteUrl)
     }
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
@@ -225,7 +237,10 @@ fun MangaDetailsScreen(
         if (liveWork.chapters.isEmpty() || refreshTrigger > 0) {
             isLoadingChapters = true
         }
-        val res = LiveMangaSiteScraper.fetchMangaDetails(liveWork.copy(mangaUrl = targetMangaUrl))
+        val res = LiveMangaSiteScraper.fetchMangaDetails(
+            work = liveWork.copy(mangaUrl = targetMangaUrl),
+            forceRefresh = refreshTrigger > 0
+        )
         if (res.work.chapters.isNotEmpty() || res.work.description.isNotBlank()) {
             val mergedChs = mergeRemoteAndLocalChapters(res.work.chapters, liveWork.chapters)
             val updated = res.work.copy(
@@ -239,13 +254,50 @@ fun MangaDetailsScreen(
             onWorkDetailsUpdated(updated)
             isLoadingChapters = false
         } else {
-            delay(1300)
             isLoadingChapters = false
         }
     }
 
-    // Run HiddenSiteWebViewBridge whenever targetMangaUrl is a valid HTTP/HTTPS URL and chapters are empty or refreshing
-    if (hasValidRemoteUrl && (liveWork.chapters.isEmpty() || !work.isFromLocalStorage || refreshTrigger > 0)) {
+    // Background prefetch of the top/resume chapters' page URLs + first 3 page images so tapping a chapter opens in 0ms!
+    LaunchedEffect(liveWork.id, liveWork.chapters.size) {
+        if (liveWork.chapters.isNotEmpty()) {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val candidates = listOfNotNull(
+                    liveWork.chapters.firstOrNull { it.lastReadPage >= 0 },
+                    liveWork.chapters.firstOrNull(),
+                    liveWork.chapters.lastOrNull()
+                ).distinctBy { it.chapterUrl }
+                val loader = com.example.ui.components.MangaCoilImageLoader.get(detailsContext)
+                candidates.take(2).forEach { targetCh ->
+                    if (targetCh.chapterUrl.startsWith("http") &&
+                        LiveMangaSiteScraper.getCachedChapterPages(targetCh.chapterUrl).isEmpty()
+                    ) {
+                        runCatching {
+                            val pageRes = LiveMangaSiteScraper.fetchChapterPages(liveWork, targetCh)
+                            if (pageRes.pageUrls.isNotEmpty()) {
+                                LiveMangaSiteScraper.cacheChapterPages(targetCh.chapterUrl, pageRes.pageUrls)
+                                pageRes.pageUrls.take(3).forEach { pageUrl ->
+                                    if (pageUrl.startsWith("http")) {
+                                        val req = coil.request.ImageRequest.Builder(detailsContext)
+                                            .data(pageUrl)
+                                            .addHeader("Referer", targetCh.chapterUrl)
+                                            .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
+                                            .memoryCacheKey(pageUrl)
+                                            .diskCacheKey(pageUrl)
+                                            .build()
+                                        loader.enqueue(req)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Only mount HiddenSiteWebViewBridge if OkHttp finished with 0 chapters or when user manually refreshes
+    if (hasValidRemoteUrl && ((!isLoadingChapters && liveWork.chapters.isEmpty()) || refreshTrigger > 0)) {
         HiddenSiteWebViewBridge(
             targetUrl = targetMangaUrl,
             jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_DETAILS,
@@ -261,6 +313,7 @@ fun MangaDetailsScreen(
                         chapters = mergedChs,
                         chaptersCount = maxOf(mergedChs.size, domRes.work.chaptersCount, liveWork.chaptersCount)
                     )
+                    LiveMangaSiteScraper.cacheWorkDetails(updated)
                     liveWork = updated
                     onWorkDetailsUpdated(updated)
                     isLoadingChapters = false

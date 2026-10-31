@@ -82,9 +82,36 @@ object LiveMangaSiteScraper {
 
     private val chapterPagesCache = ConcurrentHashMap<String, List<String>>()
     private val catalogCacheBySiteId = ConcurrentHashMap<Long, List<MangaWork>>()
+    private val workDetailsCache = ConcurrentHashMap<String, MangaWork>()
 
     fun initContext(context: Context) {
         appContext = context.applicationContext
+    }
+
+    private fun normalizeWorkCacheKey(workId: String, mangaUrl: String): String {
+        val urlKey = normalizeChapterUrlKey(mangaUrl)
+        return urlKey.ifBlank { workId.trim().lowercase(Locale.ROOT) }
+    }
+
+    fun cacheWorkDetails(work: MangaWork) {
+        val key = normalizeWorkCacheKey(work.id, work.mangaUrl)
+        if (key.isNotBlank() && (work.chapters.isNotEmpty() || work.description.isNotBlank())) {
+            workDetailsCache[key] = work
+        }
+        if (work.id.isNotBlank() && (work.chapters.isNotEmpty() || work.description.isNotBlank())) {
+            workDetailsCache[work.id.trim().lowercase(Locale.ROOT)] = work
+        }
+    }
+
+    fun getCachedWorkDetails(workId: String, mangaUrl: String): MangaWork? {
+        val urlKey = normalizeWorkCacheKey(workId, mangaUrl)
+        if (urlKey.isNotBlank()) {
+            workDetailsCache[urlKey]?.let { return it }
+        }
+        if (workId.isNotBlank()) {
+            workDetailsCache[workId.trim().lowercase(Locale.ROOT)]?.let { return it }
+        }
+        return null
     }
 
     fun cacheChapterPages(chapterUrl: String, pages: List<String>) {
@@ -472,36 +499,47 @@ object LiveMangaSiteScraper {
     fun buildCatalogTargetUrl(
         site: SiteEntity,
         searchQuery: String = "",
-        selectedGenre: String? = null
+        selectedGenre: String? = null,
+        page: Int = 1,
+        sortMode: String = "الأحدث"
     ): String {
         val base = site.url.trimEnd('/')
-        if (searchQuery.isNotBlank()) {
+        val baseUrl = if (searchQuery.isNotBlank()) {
             val encoded = try {
                 URLEncoder.encode(searchQuery.trim(), "UTF-8")
             } catch (_: Exception) {
                 searchQuery.trim()
             }
-            return when {
+            when {
                 base.contains("olympustaff", ignoreCase = true) || base.contains("team", ignoreCase = true) ->
                     "$base/series?search=$encoded"
                 else ->
                     "$base/?s=$encoded&post_type=wp-manga"
             }
-        }
-        if (!selectedGenre.isNullOrBlank() && selectedGenre != "التصنيفات") {
+        } else if (!selectedGenre.isNullOrBlank() && selectedGenre != "التصنيفات") {
             val encoded = try {
                 URLEncoder.encode(selectedGenre.trim().replace(" ", "-"), "UTF-8")
             } catch (_: Exception) {
                 selectedGenre.trim()
             }
-            return when {
+            when {
                 base.contains("olympustaff", ignoreCase = true) || base.contains("team", ignoreCase = true) ->
                     "$base/series?genre=$encoded"
                 else ->
                     "$base/manga-genre/$encoded/"
             }
+        } else {
+            base
         }
-        return base
+
+        if (page <= 1) return baseUrl
+        return if (baseUrl.contains("?")) {
+            "$baseUrl&page=$page"
+        } else if (base.contains("olympustaff", ignoreCase = true) || base.contains("team", ignoreCase = true)) {
+            "$baseUrl?page=$page"
+        } else {
+            "${baseUrl.trimEnd('/')}/page/$page/"
+        }
     }
 
     private fun buildCandidateGenreUrls(site: SiteEntity, selectedGenre: String): List<String> {
@@ -526,10 +564,12 @@ object LiveMangaSiteScraper {
     suspend fun fetchSiteCatalog(
         site: SiteEntity,
         searchQuery: String = "",
-        selectedGenre: String? = null
+        selectedGenre: String? = null,
+        page: Int = 1,
+        sortMode: String = "الأحدث"
     ): CatalogScrapeResult = withContext(Dispatchers.IO) {
         val isGenreFilter = !selectedGenre.isNullOrBlank() && selectedGenre != "التصنيفات"
-        val targetUrl = buildCatalogTargetUrl(site, searchQuery, selectedGenre)
+        val targetUrl = buildCatalogTargetUrl(site, searchQuery, selectedGenre, page, sortMode)
         try {
             val request = buildRequest(targetUrl, referer = site.url)
             var works = emptyList<MangaWork>()
@@ -566,11 +606,25 @@ object LiveMangaSiteScraper {
                 }
             }
 
-            // If homepage had few works, also try /series or /manga
+            // If homepage or paginated page had few works, also try /manga/?m_orderby=latest or /series
             if (works.size < 3 && searchQuery.isBlank() && !isGenreFilter && !hitCloudflare) {
-                val altPaths = listOf("/manga/", "/series", "/manga", "/series/")
-                for (path in altPaths) {
-                    val altUrl = site.url.trimEnd('/') + path
+                val base = site.url.trimEnd('/')
+                val altPaths = if (page > 1) {
+                    listOf(
+                        "$base/manga/page/$page/?m_orderby=latest",
+                        "$base/series?page=$page",
+                        "$base/manga/?page=$page&order=update",
+                        "$base/page/$page/"
+                    )
+                } else {
+                    listOf(
+                        "$base/manga/?m_orderby=latest",
+                        "$base/series",
+                        "$base/manga/",
+                        "$base/manga/?order=update"
+                    )
+                }
+                for (altUrl in altPaths) {
                     try {
                         httpClient.newCall(buildRequest(altUrl, referer = site.url)).execute().use { altResp ->
                             val altHtml = altResp.body?.string() ?: ""
@@ -585,8 +639,8 @@ object LiveMangaSiteScraper {
                 }
             }
 
-            // Headless WebView fallback if OkHttp got 0 works or hit Cloudflare
-            if (works.isEmpty()) {
+            // Headless WebView fallback if OkHttp got 0 works or hit Cloudflare on page 1
+            if (works.isEmpty() && page == 1) {
                 val domJson = evaluateJsInHeadlessWebView(targetUrl, JS_EXTRACT_CATALOG)
                 if (!domJson.isNullOrBlank()) {
                     val domRes = parseCatalogFromDomJson(domJson, site)
@@ -800,8 +854,24 @@ object LiveMangaSiteScraper {
         )
     }
 
-    suspend fun fetchMangaDetails(work: MangaWork): DetailsScrapeResult = withContext(Dispatchers.IO) {
+    suspend fun fetchMangaDetails(
+        work: MangaWork,
+        forceRefresh: Boolean = false
+    ): DetailsScrapeResult = withContext(Dispatchers.IO) {
         val targetUrl = work.mangaUrl.ifBlank { "${work.siteUrl.trimEnd('/')}/series/${work.id}" }
+        if (!forceRefresh) {
+            val cached = getCachedWorkDetails(work.id, targetUrl)
+            if (cached != null && cached.chapters.isNotEmpty()) {
+                return@withContext DetailsScrapeResult(
+                    work = cached.copy(
+                        localCoverPath = work.localCoverPath.ifBlank { cached.localCoverPath },
+                        isFromLocalStorage = work.isFromLocalStorage,
+                        storageSizeBytes = maxOf(work.storageSizeBytes, cached.storageSizeBytes)
+                    ),
+                    requiresCloudflare = false
+                )
+            }
+        }
         try {
             val request = buildRequest(targetUrl, referer = work.siteUrl)
             var parsedWork = work
@@ -955,6 +1025,10 @@ object LiveMangaSiteScraper {
 
             if (parsedWork.genres.isEmpty()) {
                 parsedWork = parsedWork.copy(genres = inferFallbackGenres(parsedWork.title, parsedWork.id))
+            }
+
+            if (parsedWork.chapters.isNotEmpty() || parsedWork.description.isNotBlank()) {
+                cacheWorkDetails(parsedWork)
             }
 
             DetailsScrapeResult(work = parsedWork, requiresCloudflare = hitCloudflare && parsedWork.chapters.isEmpty())

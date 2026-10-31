@@ -374,19 +374,37 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
     }
 
     fun openMangaDetails(work: MangaWork) {
+        val inMemoryDetailed = LiveMangaSiteScraper.getCachedWorkDetails(work.id, work.mangaUrl)
+        val fastSeedWork = if (work.chapters.isEmpty() && inMemoryDetailed != null && inMemoryDetailed.chapters.isNotEmpty()) {
+            inMemoryDetailed.copy(
+                localCoverPath = work.localCoverPath.ifBlank { inMemoryDetailed.localCoverPath },
+                isFromLocalStorage = work.isFromLocalStorage,
+                storageSizeBytes = maxOf(work.storageSizeBytes, inMemoryDetailed.storageSizeBytes)
+            )
+        } else {
+            work
+        }
+
+        // Navigate synchronously on the UI thread so tapping a manga feels instantaneous (0ms delay)
+        _selectedWork.value = fastSeedWork
+        if (fastSeedWork.chapters.isNotEmpty()) {
+            _selectedChapter.value = fastSeedWork.chapters.first()
+        }
+        navigateTo(AppScreen.MANGA_DETAILS)
+
         viewModelScope.launch {
-            val cachedRemoteChapters = if (work.chapters.isEmpty()) {
-                repository.getCachedWorkChapters(work.id, work.mangaUrl)
+            val cachedRemoteChapters = if (fastSeedWork.chapters.isEmpty()) {
+                repository.getCachedWorkChapters(fastSeedWork.id, fastSeedWork.mangaUrl)
             } else {
                 emptyList()
             }
-            val seedWork = if (work.chapters.isEmpty() && cachedRemoteChapters.isNotEmpty()) {
-                work.copy(
+            val seedWork = if (fastSeedWork.chapters.isEmpty() && cachedRemoteChapters.isNotEmpty()) {
+                fastSeedWork.copy(
                     chapters = cachedRemoteChapters,
-                    chaptersCount = maxOf(work.chaptersCount, cachedRemoteChapters.size)
+                    chaptersCount = maxOf(fastSeedWork.chaptersCount, cachedRemoteChapters.size)
                 )
             } else {
-                work
+                fastSeedWork
             }
 
             // Merge any locally downloaded chapters for this work without wiping out remote chapters
@@ -443,16 +461,22 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
                 seedWork
             }
 
-            _selectedWork.value = mergedWork
-            if (mergedWork.chapters.isNotEmpty()) {
-                _selectedChapter.value = mergedWork.chapters.first()
+            if (_selectedWork.value.id == mergedWork.id || _selectedWork.value.mangaUrl == mergedWork.mangaUrl) {
+                val currentChapters = _selectedWork.value.chapters
+                val finalChapters = if (currentChapters.size > mergedWork.chapters.size) currentChapters else mergedWork.chapters
+                _selectedWork.value = mergedWork.copy(
+                    chapters = finalChapters,
+                    chaptersCount = maxOf(finalChapters.size, mergedWork.chaptersCount)
+                )
+                if (finalChapters.isNotEmpty() && _selectedChapter.value.chapterUrl.isBlank()) {
+                    _selectedChapter.value = finalChapters.first()
+                }
             }
             recordPageVisit(
                 title = mergedWork.title,
                 url = mergedWork.mangaUrl.ifBlank { "${mergedWork.siteUrl}/series/${mergedWork.id}" },
                 siteName = mergedWork.siteName
             )
-            navigateTo(AppScreen.MANGA_DETAILS)
         }
     }
 
@@ -535,18 +559,50 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
     }
 
     fun openMangaChapterReader(work: MangaWork, chapter: MangaChapter) {
+        val chapterKey = chapter.chapterKey.ifBlank { "${work.id}_ch_${chapter.number}" }
+        val inMemoryPages = if (chapter.pageImageUrls.isEmpty()) {
+            LiveMangaSiteScraper.getCachedChapterPages(chapter.chapterUrl)
+        } else {
+            chapter.pageImageUrls
+        }
+        val fastLastPage = _readingProgressMap.value[work.id]?.takeIf { it.first == chapter.number }?.second
+            ?: chapter.lastReadPage
+        val fastChapter = chapter.copy(
+            pageImageUrls = inMemoryPages,
+            pageCount = maxOf(chapter.pageCount, inMemoryPages.size),
+            isRead = true,
+            lastReadPage = fastLastPage,
+            chapterKey = chapterKey
+        )
+
+        // Navigate synchronously on the UI thread for instant chapter entry (0ms delay)
+        _selectedWork.value = work
+        _selectedChapter.value = fastChapter
+
+        val currentReadMap = _readChaptersMap.value.toMutableMap()
+        val readSet = currentReadMap[work.id]?.toMutableSet() ?: mutableSetOf()
+        readSet.add(fastChapter.number)
+        currentReadMap[work.id] = readSet
+        _readChaptersMap.value = currentReadMap
+
+        val fastResumePage = fastChapter.lastReadPage.takeIf { it >= 0 } ?: 0
+        val currentProgressMap = _readingProgressMap.value.toMutableMap()
+        currentProgressMap[work.id] = fastChapter.number to fastResumePage
+        _readingProgressMap.value = currentProgressMap
+
+        navigateTo(AppScreen.MANGA_READER)
+
         viewModelScope.launch {
             // Check if this chapter has locally downloaded files on disk
-            val chapterKey = chapter.chapterKey.ifBlank { "${work.id}_ch_${chapter.number}" }
             val localChEntity = repository.dao.getDownloadedChapterByKey(chapterKey)
                 ?: repository.dao.getDownloadedChaptersForWorkOnce(work.id).find { it.chapterNumber == chapter.number }
             val savedProgress = repository.readingProgressRepository.getChapterProgress(work.id, chapter.number)
-            val effectiveLastPage = savedProgress?.lastPageIndex ?: chapter.lastReadPage
+            val effectiveLastPage = savedProgress?.lastPageIndex ?: fastChapter.lastReadPage
 
             val effectiveChapter = if (localChEntity != null) {
                 val rawPaths = repository.localStorageManager.decodeLocalPathsJson(localChEntity.localPagePathsJson)
                 val validPaths = repository.localStorageManager.filterExistingValidPagePaths(rawPaths)
-                val expectedPages = localChEntity.totalPages.coerceAtLeast(rawPaths.size).coerceAtLeast(chapter.pageCount).coerceAtLeast(1)
+                val expectedPages = localChEntity.totalPages.coerceAtLeast(rawPaths.size).coerceAtLeast(fastChapter.pageCount).coerceAtLeast(1)
                 val isTrulyComplete = localChEntity.status == "COMPLETED" &&
                     repository.localStorageManager.verifyChapterFilesComplete(expectedPages, validPaths)
                 val effectiveStatus = when {
@@ -555,7 +611,7 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
                     localChEntity.status == "COMPLETED" -> "FAILED"
                     else -> localChEntity.status
                 }
-                chapter.copy(
+                fastChapter.copy(
                     localPagePaths = validPaths,
                     downloadedPagesCount = validPaths.size,
                     isDownloaded = isTrulyComplete,
@@ -567,27 +623,18 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
                     chapterKey = localChEntity.chapterKey.ifBlank { chapterKey }
                 )
             } else {
-                chapter.copy(
+                fastChapter.copy(
                     isRead = true,
                     lastReadPage = effectiveLastPage,
                     chapterKey = chapterKey
                 )
             }
 
-            _selectedWork.value = work
-            _selectedChapter.value = effectiveChapter
-
-            val currentReadMap = _readChaptersMap.value.toMutableMap()
-            val readSet = currentReadMap[work.id]?.toMutableSet() ?: mutableSetOf()
-            readSet.add(effectiveChapter.number)
-            currentReadMap[work.id] = readSet
-            _readChaptersMap.value = currentReadMap
+            if (_selectedChapter.value.number == effectiveChapter.number) {
+                _selectedChapter.value = effectiveChapter
+            }
 
             val resumePage = effectiveChapter.lastReadPage.takeIf { it >= 0 } ?: 0
-            val currentProgressMap = _readingProgressMap.value.toMutableMap()
-            currentProgressMap[work.id] = effectiveChapter.number to resumePage
-            _readingProgressMap.value = currentProgressMap
-
             repository.readingProgressRepository.saveProgress(
                 workId = work.id,
                 workTitle = work.title,
@@ -604,7 +651,6 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
                 url = effectiveChapter.chapterUrl.ifBlank { "${work.siteUrl}/series/${work.id}/chapter-${effectiveChapter.number}" },
                 siteName = work.siteName
             )
-            navigateTo(AppScreen.MANGA_READER)
         }
     }
 

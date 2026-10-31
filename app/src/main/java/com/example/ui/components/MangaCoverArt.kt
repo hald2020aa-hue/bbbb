@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -95,6 +96,8 @@ import java.util.concurrent.TimeUnit
 object MangaCoilImageLoader {
     @Volatile
     private var instance: ImageLoader? = null
+
+    val pageAspectRatioCache = java.util.concurrent.ConcurrentHashMap<String, Float>()
 
     fun get(context: Context): ImageLoader {
         return instance ?: synchronized(this) {
@@ -456,12 +459,18 @@ fun ChapterPageIllustration(
             emptyList()
         }
         if (hasValidLocalFile) {
+            val localCacheKey = if (retryNonce == 0 && !autoCropBorders) {
+                "file:$cleanLocalPath"
+            } else {
+                "file:${cleanLocalPath}_${retryNonce}_$autoCropBorders"
+            }
             // Read directly from local disk without any network request (100% offline capable in Airplane mode)
             ImageRequest.Builder(context)
                 .data(File(cleanLocalPath))
                 .crossfade(false)
+                .memoryCacheKey(localCacheKey)
+                .diskCacheKey("file:$cleanLocalPath")
                 .transformations(cropTransformations)
-                .setParameter("retry_nonce", retryNonce)
                 .listener(
                     onError = { _, result ->
                         lastErrorReason = result.throwable.localizedMessage ?: "ملف الصورة المحلي تالف"
@@ -479,16 +488,22 @@ fun ChapterPageIllustration(
         } else {
             val effectiveReferer = refererUrl?.ifBlank { work.mangaUrl.ifBlank { work.siteUrl } }
                 ?: work.mangaUrl.ifBlank { work.siteUrl }
+            val memKey = if (retryNonce == 0 && !autoCropBorders) {
+                cleanUrl
+            } else {
+                "${cleanUrl}_${retryNonce}_$autoCropBorders"
+            }
             val builder = ImageRequest.Builder(context)
                 .data(cleanUrl)
                 .crossfade(false)
+                .memoryCacheKey(memKey)
+                .diskCacheKey(cleanUrl)
                 .transformations(cropTransformations)
                 .diskCachePolicy(CachePolicy.ENABLED)
                 .memoryCachePolicy(
                     if (retryNonce > 0) CachePolicy.WRITE_ONLY else CachePolicy.ENABLED
                 )
-                .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
-                .setParameter("retry_nonce", retryNonce)
+                .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent.replace("; wv", ""))
                 .listener(
                     onError = { _, result ->
                         val msg = result.throwable.localizedMessage ?: "خطأ في الاتصال أو الصورة غير مدعومة"
@@ -521,6 +536,11 @@ fun ChapterPageIllustration(
         }
     }
 
+    val cacheRatioKey = remember(cleanLocalPath, cleanUrl, pageIndex) {
+        cleanLocalPath.ifBlank { cleanUrl.ifBlank { "${work.id}_${chapterNumber}_$pageIndex" } }
+    }
+    val cachedRatio = MangaCoilImageLoader.pageAspectRatioCache[cacheRatioKey]
+
     SubcomposeAsyncImage(
         model = imageRequest,
         imageLoader = imageLoader,
@@ -530,27 +550,24 @@ fun ChapterPageIllustration(
             .fillMaxWidth()
             .testTag("reader_page_image_${pageIndex + 1}"),
         loading = {
-            Box(
-                modifier = Modifier
+            val placeholderMod = if (cachedRatio != null && cachedRatio > 0.05f) {
+                Modifier
                     .fillMaxWidth()
-                    .height(380.dp)
-                    .background(Color(0xFF0B0D13)),
+                    .aspectRatio(cachedRatio)
+            } else {
+                Modifier
+                    .fillMaxWidth()
+                    .height(460.dp)
+            }
+            Box(
+                modifier = placeholderMod.background(Color(0xFF0A0C12)),
                 contentAlignment = Alignment.Center
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(
-                        color = PeriwinklePrimary,
-                        strokeWidth = 2.5.dp,
-                        modifier = Modifier.size(32.dp)
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Text(
-                        text = "جاري تحميل الصفحة ${pageIndex + 1} من $totalPages",
-                        color = TextSecondaryGrey,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
+                CircularProgressIndicator(
+                    color = PeriwinklePrimary,
+                    strokeWidth = 2.5.dp,
+                    modifier = Modifier.size(30.dp)
+                )
             }
         },
         error = {
@@ -591,6 +608,10 @@ fun ChapterPageIllustration(
         },
         success = { state ->
             val intrinsicSize = state.painter.intrinsicSize
+            if (intrinsicSize.width > 150f && intrinsicSize.height > 150f) {
+                val ratio = (intrinsicSize.width / intrinsicSize.height).coerceIn(0.08f, 3.0f)
+                MangaCoilImageLoader.pageAspectRatioCache[cacheRatioKey] = ratio
+            }
             val isTinyEmojiOrIcon = intrinsicSize.width > 0f &&
                 intrinsicSize.height > 0f &&
                 intrinsicSize.width <= 150f &&
@@ -630,15 +651,6 @@ fun ChapterPageIllustration(
                     }
                 }
             } else {
-                val drawable = state.result.drawable
-                val rawBitmap = (drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
-                val slices = remember(rawBitmap, splitLongStrip) {
-                    if (splitLongStrip && rawBitmap != null && rawBitmap.height > 2600 && rawBitmap.height > rawBitmap.width * 2.6f) {
-                        com.example.data.storage.LocalStorageManager.splitTallBitmapIfNeeded(rawBitmap, 2400)
-                    } else {
-                        null
-                    }
-                }
                 val cropModifier = if (autoCropBorders) {
                     Modifier
                         .fillMaxWidth()
@@ -650,25 +662,11 @@ fun ChapterPageIllustration(
                 } else {
                     Modifier.fillMaxWidth()
                 }
-                if (slices != null && slices.size > 1) {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        slices.forEachIndexed { sliceIdx, sliceBmp ->
-                            androidx.compose.foundation.Image(
-                                bitmap = remember(sliceBmp) { sliceBmp.asImageBitmap() },
-                                contentDescription = "صفحة ${pageIndex + 1} - جزء ${sliceIdx + 1}",
-                                contentScale = if (autoCropBorders) ContentScale.Crop else ContentScale.FillWidth,
-                                colorFilter = activeColorFilter,
-                                modifier = cropModifier
-                            )
-                        }
-                    }
-                } else {
-                    SubcomposeAsyncImageContent(
-                        modifier = cropModifier,
-                        contentScale = if (autoCropBorders) ContentScale.Crop else ContentScale.FillWidth,
-                        colorFilter = activeColorFilter
-                    )
-                }
+                SubcomposeAsyncImageContent(
+                    modifier = cropModifier,
+                    contentScale = if (autoCropBorders) ContentScale.Crop else ContentScale.FillWidth,
+                    colorFilter = activeColorFilter
+                )
             }
         }
     )
