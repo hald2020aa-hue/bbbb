@@ -43,6 +43,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -1087,23 +1088,31 @@ fun HiddenSiteWebViewBridge(
 ) {
     if (targetUrl.isBlank() || !targetUrl.startsWith("http")) return
 
+    val currentOnResultJson by rememberUpdatedState(onResultJson)
+    val currentJsScript by rememberUpdatedState(jsExtractorScript)
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    var lastRequestedKey by remember { mutableStateOf("") }
 
-    LaunchedEffect(targetUrl, reloadTrigger) {
-        if (reloadTrigger > 0) {
+    LaunchedEffect(targetUrl, reloadTrigger, webViewRef) {
+        val wv = webViewRef ?: return@LaunchedEffect
+        val reqKey = "$targetUrl|$reloadTrigger"
+        if (reqKey != lastRequestedKey) {
+            lastRequestedKey = reqKey
             try {
-                webViewRef?.loadUrl(targetUrl)
+                wv.loadUrl(targetUrl)
             } catch (_: Exception) {
             }
         }
     }
 
-    DisposableEffect(targetUrl) {
+    DisposableEffect(Unit) {
         onDispose {
             try {
                 webViewRef?.stopLoading()
+                webViewRef?.destroy()
             } catch (_: Exception) {
             }
+            webViewRef = null
         }
     }
 
@@ -1116,35 +1125,36 @@ fun HiddenSiteWebViewBridge(
             factory = { ctx ->
                 WebView(ctx).apply {
                     layoutParams = ViewGroup.LayoutParams(1, 1)
-                    val cookieManager = CookieManager.getInstance()
-                    cookieManager.setAcceptCookie(true)
-                    cookieManager.setAcceptThirdPartyCookies(this, true)
-
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    settings.allowFileAccess = false
-                    settings.allowContentAccess = false
-                    settings.loadsImagesAutomatically = false
-                    settings.blockNetworkImage = true
-                    LiveMangaSiteScraper.activeUserAgent = (settings.userAgentString ?: LiveMangaSiteScraper.DEFAULT_USER_AGENT)
-                        .replace("; wv", "")
+                    LiveMangaSiteScraper.configureWebViewForSite(this, loadImages = false)
 
                     webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: android.webkit.WebResourceRequest?
+                        ): Boolean = false
+
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             CookieManager.getInstance().flush()
-                            // Trigger scroll events & click "show more chapters" buttons so lazy-load / AJAX scripts populate DOM
-                            view?.evaluateJavascript(
-                                "(function(){ try { var btns = document.querySelectorAll('.chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters'); for(var i=0;i<btns.length;i++){ if(btns[i].click) btns[i].click(); } window.scrollTo(0, 1200); window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0); } catch(e){} })();",
-                                null
-                            )
-                            val pollDelays = listOf(450L, 1400L, 2800L)
+                            val pageTitle = view?.title.orEmpty()
+                            val isChallengeTitle = pageTitle.contains("Just a moment", ignoreCase = true) ||
+                                pageTitle.contains("انتظر لحظة", ignoreCase = true) ||
+                                pageTitle.contains("Attention Required", ignoreCase = true) ||
+                                pageTitle.contains("DDOS-GUARD", ignoreCase = true)
+                            if (!isChallengeTitle) {
+                                // Trigger scroll events & click "show more chapters" buttons only when not on a Cloudflare challenge page
+                                view?.evaluateJavascript(
+                                    "(function(){ try { var btns = document.querySelectorAll('.chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters'); for(var i=0;i<btns.length;i++){ if(btns[i].click) btns[i].click(); } window.scrollTo(0, 1200); window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0); } catch(e){} })();",
+                                    null
+                                )
+                            }
+                            val pollDelays = if (isChallengeTitle) listOf(900L) else listOf(500L, 1600L)
                             for (delayMs in pollDelays) {
                                 view?.postDelayed({
                                     try {
-                                        view.evaluateJavascript(jsExtractorScript) { rawJson ->
+                                        view.evaluateJavascript(currentJsScript) { rawJson ->
                                             if (!rawJson.isNullOrBlank() && rawJson != "null") {
-                                                onResultJson(rawJson)
+                                                currentOnResultJson(rawJson)
                                             }
                                         }
                                     } catch (_: Exception) {
@@ -1153,14 +1163,14 @@ fun HiddenSiteWebViewBridge(
                             }
                         }
                     }
+                    lastRequestedKey = "$targetUrl|$reloadTrigger"
                     webViewRef = this
                     loadUrl(targetUrl)
                 }
             },
-            update = { view ->
-                if (view.url != targetUrl) {
-                    view.loadUrl(targetUrl)
-                }
+            update = { _ ->
+                // Never call view.loadUrl(targetUrl) inside update{}, because WebView normalizes URLs
+                // (e.g. adding a trailing '/' or Cloudflare query tokens) which previously caused an infinite reload loop!
             }
         )
     }
@@ -1168,8 +1178,8 @@ fun HiddenSiteWebViewBridge(
 
 /**
  * Interactive Cloudflare Protection & Live Site Verification Modal ("صفحة التحقق اليدوي").
- * Lets the user manually bypass Cloudflare / anti-bot challenges, unifies User-Agent & Cookies
- * with OkHttp/Coil, and automatically extracts & displays the manga natively inside the app as soon as verification completes.
+ * Lets the user manually bypass Cloudflare / Turnstile challenges without background WebView or JS interference,
+ * and extracts & displays the manga natively inside the app as soon as verification completes.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -1180,6 +1190,10 @@ fun CloudflareProtectionDialog(
     onExtractedDomJson: ((String) -> Unit)? = null,
     onDismissAndRefresh: () -> Unit
 ) {
+    val currentOnExtractedDomJson by rememberUpdatedState(onExtractedDomJson)
+    val currentOnDismissAndRefresh by rememberUpdatedState(onDismissAndRefresh)
+    val currentJsExtractorScript by rememberUpdatedState(jsExtractorScript)
+
     var isLoadingPage by remember { mutableStateOf(true) }
     var isVerifiedSuccess by remember { mutableStateOf(false) }
     var statusBannerText by remember {
@@ -1187,50 +1201,80 @@ fun CloudflareProtectionDialog(
     }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
 
-    // Continuously poll the live WebView DOM while the verification page is open so that
-    // as soon as the user passes the verification challenge, the manga is extracted and shown natively!
-    LaunchedEffect(webViewInstance, jsExtractorScript, isVerifiedSuccess) {
-        val view = webViewInstance ?: return@LaunchedEffect
-        val script = jsExtractorScript ?: return@LaunchedEffect
-        while (!isVerifiedSuccess) {
-            kotlinx.coroutines.delay(1200L)
-            try {
-                CookieManager.getInstance().flush()
-                view.evaluateJavascript(
-                    "(function(){ try { var btns = document.querySelectorAll('.chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters'); for(var i=0;i<btns.length;i++){ if(btns[i].click) btns[i].click(); } } catch(e){} })();",
-                    null
-                )
-                view.evaluateJavascript(script) { rawJson ->
-                    if (!rawJson.isNullOrBlank() && rawJson != "null" && !isVerifiedSuccess) {
-                        val hasRealContent = rawJson.contains("\"items\":[{") ||
-                            rawJson.contains("\"chapters\":[{") ||
-                            rawJson.contains("\"galleryPages\":[\"") ||
-                            rawJson.contains("\"pages\":[\"") ||
-                            rawJson.contains("\"updates\":[{")
-                        val isStillChallenge = rawJson.contains("\"cf\":true")
-                        if (hasRealContent && !isStillChallenge) {
-                            CookieManager.getInstance().flush()
-                            onExtractedDomJson?.invoke(rawJson)
-                            statusBannerText = "تم التحقق بنجاح! جارٍ عرض المانجا داخل التطبيق..."
-                            isVerifiedSuccess = true
-                        }
+    fun inspectAndExtractFromRealPage(view: WebView?, forceExtract: Boolean = false, onDone: (() -> Unit)? = null) {
+        val targetView = view ?: run {
+            onDone?.invoke()
+            return
+        }
+        val script = currentJsExtractorScript ?: run {
+            onDone?.invoke()
+            return
+        }
+        val pageTitle = targetView.title.orEmpty()
+        val isChallengeTitle = pageTitle.contains("Just a moment", ignoreCase = true) ||
+            pageTitle.contains("انتظر لحظة", ignoreCase = true) ||
+            pageTitle.contains("Attention Required", ignoreCase = true) ||
+            pageTitle.contains("DDOS-GUARD", ignoreCase = true)
+
+        if (isChallengeTitle && !forceExtract) {
+            statusBannerText = "يرجى الضغط على مربع التحقق البشري والانتظار لثوانٍ حتى يفتح الموقع..."
+            onDone?.invoke()
+            return
+        }
+
+        try {
+            CookieManager.getInstance().flush()
+            targetView.evaluateJavascript(
+                "(function(){ try { var btns = document.querySelectorAll('.chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters'); for(var i=0;i<btns.length;i++){ if(btns[i].click) btns[i].click(); } window.scrollTo(0, 900); window.scrollTo(0, 0); } catch(e){} })();",
+                null
+            )
+            targetView.evaluateJavascript(script) { rawJson ->
+                if (!rawJson.isNullOrBlank() && rawJson != "null") {
+                    val isStillChallenge = rawJson.contains("\"cf\":true")
+                    val hasRealContent = rawJson.contains("\"items\":[{") ||
+                        rawJson.contains("\"chapters\":[{") ||
+                        rawJson.contains("\"galleryPages\":[\"") ||
+                        rawJson.contains("\"pages\":[\"") ||
+                        rawJson.contains("\"updates\":[{") ||
+                        (!isStillChallenge && rawJson.contains("\"html\":\"<"))
+                    if (hasRealContent && !isStillChallenge) {
+                        CookieManager.getInstance().flush()
+                        currentOnExtractedDomJson?.invoke(rawJson)
+                        statusBannerText = "تم التحقق بنجاح! جارٍ عرض المانجا داخل التطبيق..."
+                        isVerifiedSuccess = true
+                    } else if (forceExtract) {
+                        currentOnExtractedDomJson?.invoke(rawJson)
                     }
                 }
-            } catch (_: Throwable) {
+                onDone?.invoke()
             }
+        } catch (_: Throwable) {
+            onDone?.invoke()
         }
     }
 
     LaunchedEffect(isVerifiedSuccess) {
         if (isVerifiedSuccess) {
-            kotlinx.coroutines.delay(450L)
+            kotlinx.coroutines.delay(350L)
             CookieManager.getInstance().flush()
-            onDismissAndRefresh()
+            currentOnDismissAndRefresh()
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                CookieManager.getInstance().flush()
+                webViewInstance?.stopLoading()
+                webViewInstance?.destroy()
+            } catch (_: Throwable) {
+            }
+            webViewInstance = null
         }
     }
 
     Dialog(
-        onDismissRequest = onDismissAndRefresh,
+        onDismissRequest = currentOnDismissAndRefresh,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Surface(
@@ -1279,13 +1323,13 @@ fun CloudflareProtectionDialog(
                         IconButton(onClick = { webViewInstance?.reload() }) {
                             Icon(Icons.Default.Refresh, contentDescription = "تحديث", tint = TextPrimaryWhite)
                         }
-                        IconButton(onClick = onDismissAndRefresh) {
+                        IconButton(onClick = currentOnDismissAndRefresh) {
                             Icon(Icons.Default.Close, contentDescription = "إغلاق", tint = TextPrimaryWhite)
                         }
                     }
                 }
 
-                // Live WebView for solving Cloudflare / Turnstile / CAPTCHA and syncing session cookies
+                // Live WebView for solving Cloudflare / Turnstile / CAPTCHA without background script interference
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -1295,28 +1339,34 @@ fun CloudflareProtectionDialog(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
                             WebView(ctx).apply {
-                                val cm = CookieManager.getInstance()
-                                cm.setAcceptCookie(true)
-                                cm.setAcceptThirdPartyCookies(this, true)
+                                isFocusable = true
+                                isFocusableInTouchMode = true
+                                LiveMangaSiteScraper.configureWebViewForSite(this, loadImages = true)
 
-                                settings.javaScriptEnabled = true
-                                settings.domStorageEnabled = true
-                                settings.databaseEnabled = true
-                                settings.javaScriptCanOpenWindowsAutomatically = true
-                                settings.allowFileAccess = false
-                                settings.allowContentAccess = false
-                                settings.useWideViewPort = true
-                                settings.loadWithOverviewMode = true
-                                settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-
-                                // Unify User-Agent (strip "; wv") so cf_clearance cookies work in OkHttp and Coil!
-                                val cleanUa = (settings.userAgentString ?: LiveMangaSiteScraper.DEFAULT_USER_AGENT)
-                                    .replace("; wv", "")
-                                settings.userAgentString = cleanUa
-                                LiveMangaSiteScraper.activeUserAgent = cleanUa
-
-                                webChromeClient = WebChromeClient()
+                                webChromeClient = object : WebChromeClient() {
+                                    override fun onReceivedTitle(view: WebView?, title: String?) {
+                                        super.onReceivedTitle(view, title)
+                                        val t = title.orEmpty()
+                                        val isCfTitle = t.contains("Just a moment", ignoreCase = true) ||
+                                            t.contains("انتظر لحظة", ignoreCase = true) ||
+                                            t.contains("Attention Required", ignoreCase = true) ||
+                                            t.contains("DDOS-GUARD", ignoreCase = true)
+                                        if (!isCfTitle && t.isNotBlank()) {
+                                            statusBannerText = "تم فتح الصفحة! جارٍ استخراج المانجا وعرضها بالتطبيق..."
+                                            view?.postDelayed({
+                                                if (!isVerifiedSuccess) {
+                                                    inspectAndExtractFromRealPage(view, forceExtract = false)
+                                                }
+                                            }, 650L)
+                                        }
+                                    }
+                                }
                                 webViewClient = object : WebViewClient() {
+                                    override fun shouldOverrideUrlLoading(
+                                        view: WebView?,
+                                        request: android.webkit.WebResourceRequest?
+                                    ): Boolean = false
+
                                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                         super.onPageStarted(view, url, favicon)
                                         isLoadingPage = true
@@ -1326,27 +1376,22 @@ fun CloudflareProtectionDialog(
                                         super.onPageFinished(view, finishedUrl)
                                         isLoadingPage = false
                                         CookieManager.getInstance().flush()
-                                        if (jsExtractorScript != null && onExtractedDomJson != null) {
-                                            view?.postDelayed({
-                                                try {
-                                                    view.evaluateJavascript(jsExtractorScript) { rawJson ->
-                                                        if (!rawJson.isNullOrBlank() && rawJson != "null") {
-                                                            onExtractedDomJson(rawJson)
-                                                            val hasRealContent = rawJson.contains("\"items\":[{") ||
-                                                                rawJson.contains("\"chapters\":[{") ||
-                                                                rawJson.contains("\"galleryPages\":[\"") ||
-                                                                rawJson.contains("\"pages\":[\"") ||
-                                                                rawJson.contains("\"updates\":[{")
-                                                            val isStillChallenge = rawJson.contains("\"cf\":true")
-                                                            if (hasRealContent && !isStillChallenge) {
-                                                                statusBannerText = "تم التحقق بنجاح! جارٍ عرض المانجا داخل التطبيق..."
-                                                                isVerifiedSuccess = true
-                                                            }
-                                                        }
+                                        // Only run extraction if the finished page is NOT the Cloudflare challenge interstitial
+                                        val t = view?.title.orEmpty()
+                                        val isCfTitle = t.contains("Just a moment", ignoreCase = true) ||
+                                            t.contains("انتظر لحظة", ignoreCase = true) ||
+                                            t.contains("Attention Required", ignoreCase = true) ||
+                                            t.contains("DDOS-GUARD", ignoreCase = true)
+                                        if (!isCfTitle) {
+                                            for (delayMs in listOf(550L, 1700L, 3000L)) {
+                                                view?.postDelayed({
+                                                    if (!isVerifiedSuccess) {
+                                                        inspectAndExtractFromRealPage(view, forceExtract = false)
                                                     }
-                                                } catch (_: Exception) {
-                                                }
-                                            }, 650L)
+                                                }, delayMs)
+                                            }
+                                        } else {
+                                            statusBannerText = "أكمل التحقق البشري في الصفحة أدناه ليتم فتح الموقع تلقائياً"
                                         }
                                     }
                                 }
@@ -1380,15 +1425,12 @@ fun CloudflareProtectionDialog(
                         onClick = {
                             CookieManager.getInstance().flush()
                             val view = webViewInstance
-                            if (view != null && jsExtractorScript != null && onExtractedDomJson != null) {
-                                view.evaluateJavascript(jsExtractorScript) { rawJson ->
-                                    if (!rawJson.isNullOrBlank() && rawJson != "null") {
-                                        onExtractedDomJson(rawJson)
-                                    }
-                                    onDismissAndRefresh()
+                            if (view != null && currentJsExtractorScript != null && currentOnExtractedDomJson != null) {
+                                inspectAndExtractFromRealPage(view, forceExtract = true) {
+                                    currentOnDismissAndRefresh()
                                 }
                             } else {
-                                onDismissAndRefresh()
+                                currentOnDismissAndRefresh()
                             }
                         },
                         colors = ButtonDefaults.buttonColors(

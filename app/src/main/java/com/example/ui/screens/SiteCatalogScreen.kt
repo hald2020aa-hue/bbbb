@@ -242,14 +242,16 @@ fun SiteCatalogScreen(
                 }
             }
         } else if (result.requiresCloudflare) {
-            requiresCloudflare = true
-            errorMessage = result.errorMessage
+            if (liveWorks.isEmpty()) {
+                requiresCloudflare = true
+                errorMessage = result.errorMessage
+            }
             isLoadingCatalog = false
             isLoadingMoreCatalog = false
         } else {
             if (currentPageNumber > 1) {
                 hasMoreCatalogPages = false
-            } else {
+            } else if (liveWorks.isEmpty()) {
                 errorMessage = result.errorMessage
             }
             isLoadingCatalog = false
@@ -293,10 +295,11 @@ fun SiteCatalogScreen(
         isLoadingSiteUpdates = false
     }
 
-    // Only mount HiddenSiteWebViewBridge when OkHttp scraping finished with 0 results or manual refresh was requested
-    val shouldMountWebViewFallback = (!isLoadingCatalog && liveWorks.isEmpty()) ||
-        (activeSectionTab == "UPDATES" && !isLoadingSiteUpdates && siteLatestUpdates.isEmpty()) ||
-        refreshTrigger > 0
+    // Only mount HiddenSiteWebViewBridge when OkHttp scraping finished with 0 results, and NEVER while CloudflareProtectionDialog is open
+    val shouldMountWebViewFallback = !showProtectionDialog && !requiresCloudflare && (
+        (!isLoadingCatalog && liveWorks.isEmpty()) ||
+            (activeSectionTab == "UPDATES" && !isLoadingSiteUpdates && siteLatestUpdates.isEmpty())
+        )
     if (shouldMountWebViewFallback) {
         HiddenSiteWebViewBridge(
             targetUrl = if (activeSectionTab == "UPDATES") site.url else targetCatalogUrl,
@@ -1351,15 +1354,26 @@ fun SiteCatalogScreen(
                         }
                         siteLatestUpdates = fallbackUpdates
                         siteUpdatesError = null
+                        siteUpdatesShowingCachedOffline = false
                         isLoadingSiteUpdates = false
+                        onCacheSiteUpdates(fallbackUpdates)
                     }
                 }
             },
             onDismissAndRefresh = {
                 showProtectionDialog = false
-                refreshTrigger++
-                siteUpdatesRefreshTrigger++
-                onShowToast("تم تحديث جلسة التحقق وعرض المانجا داخل التطبيق")
+                if (liveWorks.isNotEmpty() || siteLatestUpdates.isNotEmpty()) {
+                    requiresCloudflare = false
+                    errorMessage = null
+                    siteUpdatesError = null
+                    isLoadingCatalog = false
+                    isLoadingSiteUpdates = false
+                    onShowToast("تم التحقق وعرض المانجا داخل التطبيق بنجاح")
+                } else {
+                    refreshTrigger++
+                    siteUpdatesRefreshTrigger++
+                    onShowToast("تم تحديث جلسة التحقق، جارٍ جلب المانجا...")
+                }
             }
         )
     }

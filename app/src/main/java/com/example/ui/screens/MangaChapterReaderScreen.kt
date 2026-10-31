@@ -257,8 +257,8 @@ fun MangaChapterReaderScreen(
         }
     }
 
-    // Hidden WebView DOM Bridge ONLY after OkHttp finished with 0 pages or on manual retry (avoids main-thread WebView stutter!)
-    if ((!isOfflineComplete && targetChapterUrl.startsWith("http") && isChapterLoaded && livePageUrls.isEmpty() && localPagePaths.isEmpty()) || refreshTrigger > 0) {
+    // Hidden WebView DOM Bridge ONLY after OkHttp finished with 0 pages and when Cloudflare modal is NOT open
+    if (!isOfflineComplete && !showProtectionModal && !requiresCloudflare && targetChapterUrl.startsWith("http") && isChapterLoaded && livePageUrls.isEmpty() && localPagePaths.isEmpty()) {
         HiddenSiteWebViewBridge(
             targetUrl = targetChapterUrl,
             jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CHAPTER_PAGES,
@@ -2593,8 +2593,16 @@ fun MangaChapterReaderScreen(
             },
             onDismissAndRefresh = {
                 showProtectionModal = false
-                refreshTrigger++
-                onShowToast("تم تخطي التحقق وعرض صفحات الفصل داخل القارئ")
+                if (livePageUrls.isNotEmpty()) {
+                    requiresCloudflare = false
+                    lastScrapeError = null
+                    loadingProgress = 100
+                    isChapterLoaded = true
+                    onShowToast("تم تخطي التحقق وعرض صفحات الفصل داخل القارئ")
+                } else {
+                    refreshTrigger++
+                    onShowToast("تم تحديث جلسة التحقق، جارٍ جلب صفحات الفصل...")
+                }
             }
         )
     }

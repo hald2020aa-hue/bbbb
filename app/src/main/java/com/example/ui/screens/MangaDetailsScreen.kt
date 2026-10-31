@@ -317,8 +317,8 @@ fun MangaDetailsScreen(
         }
     }
 
-    // Only mount HiddenSiteWebViewBridge if OkHttp finished with 0 chapters or when user manually refreshes
-    if (hasValidRemoteUrl && ((!isLoadingChapters && liveWork.chapters.isEmpty()) || refreshTrigger > 0)) {
+    // Only mount HiddenSiteWebViewBridge if OkHttp finished with 0 chapters and CloudflareProtectionDialog is NOT open
+    if (hasValidRemoteUrl && !showProtectionDialog && !requiresCloudflare && !isLoadingChapters && liveWork.chapters.isEmpty()) {
         HiddenSiteWebViewBridge(
             targetUrl = targetMangaUrl,
             jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_DETAILS,
@@ -2328,8 +2328,14 @@ fun MangaDetailsScreen(
             },
             onDismissAndRefresh = {
                 showProtectionDialog = false
-                refreshTrigger++
-                onShowToast("تم تخطي التحقق وعرض فصول المانجا داخل التطبيق")
+                if (liveWork.chapters.isNotEmpty()) {
+                    requiresCloudflare = false
+                    isLoadingChapters = false
+                    onShowToast("تم تخطي التحقق وعرض فصول المانجا داخل التطبيق")
+                } else {
+                    refreshTrigger++
+                    onShowToast("تم تحديث جلسة التحقق، جارٍ جلب الفصول...")
+                }
             }
         )
     }

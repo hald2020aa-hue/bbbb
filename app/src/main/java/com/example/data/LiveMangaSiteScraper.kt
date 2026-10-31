@@ -88,6 +88,34 @@ object LiveMangaSiteScraper {
         appContext = context.applicationContext
     }
 
+    @SuppressLint("SetJavaScriptEnabled")
+    fun configureWebViewForSite(webView: WebView, loadImages: Boolean = true) {
+        val cm = CookieManager.getInstance()
+        cm.setAcceptCookie(true)
+        cm.setAcceptThirdPartyCookies(webView, true)
+
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            javaScriptCanOpenWindowsAutomatically = true
+            setSupportMultipleWindows(false)
+            allowFileAccess = false
+            allowContentAccess = false
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            loadsImagesAutomatically = loadImages
+            blockNetworkImage = !loadImages
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            cacheMode = WebSettings.LOAD_DEFAULT
+            val nativeUa = userAgentString
+            if (!nativeUa.isNullOrBlank()) {
+                // Keep WebView's genuine User-Agent so it matches navigator.userAgentData / Sec-CH-UA inside Turnstile iframes
+                activeUserAgent = nativeUa
+            }
+        }
+    }
+
     private fun normalizeWorkCacheKey(workId: String, mangaUrl: String): String {
         val urlKey = normalizeChapterUrlKey(mangaUrl)
         return urlKey.ifBlank { workId.trim().lowercase(Locale.ROOT) }
@@ -171,20 +199,7 @@ object LiveMangaSiteScraper {
                     }
                     try {
                         val wv = WebView(ctx).apply {
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            settings.databaseEnabled = true
-                            settings.loadsImagesAutomatically = false
-                            settings.blockNetworkImage = true
-                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                            val ua = settings.userAgentString
-                            if (!ua.isNullOrBlank()) {
-                                activeUserAgent = ua.replace("; wv", "")
-                                settings.userAgentString = activeUserAgent
-                            }
-                            val cm = CookieManager.getInstance()
-                            cm.setAcceptCookie(true)
-                            cm.setAcceptThirdPartyCookies(this, true)
+                            configureWebViewForSite(this, loadImages = true)
                             webViewClient = object : WebViewClient() {
                                 private var pollCount = 0
                                 override fun shouldOverrideUrlLoading(
@@ -398,11 +413,13 @@ object LiveMangaSiteScraper {
                 html.contains("cloudflare", ignoreCase = true) ||
                 html.contains("cf-browser-verification", ignoreCase = true) ||
                 html.contains("Just a moment", ignoreCase = true) ||
+                html.contains("انتظر لحظة", ignoreCase = true) ||
                 html.contains("challenge-platform", ignoreCase = true) ||
                 html.contains("cf-turnstile", ignoreCase = true) ||
                 html.contains("ddos-guard", ignoreCase = true) ||
                 html.contains("Attention Required", ignoreCase = true) ||
                 html.contains("Verify you are human", ignoreCase = true) ||
+                html.contains("تحقق من أنك إنسان", ignoreCase = true) ||
                 html.contains("Checking your browser", ignoreCase = true) ||
                 html.contains("sucuri", ignoreCase = true) ||
                 html.contains("captcha", ignoreCase = true)
@@ -411,14 +428,17 @@ object LiveMangaSiteScraper {
             }
         }
         return html.contains("<title>Just a moment", ignoreCase = true) ||
+            html.contains("<title>انتظر لحظة", ignoreCase = true) ||
             html.contains("<title>Attention Required", ignoreCase = true) ||
             html.contains("<title>DDOS-GUARD", ignoreCase = true) ||
             html.contains("cf-challenge-running", ignoreCase = true) ||
-            html.contains("challenges.cloudflare.com/turnstile", ignoreCase = true) ||
+            html.contains("id=\"challenge-running\"", ignoreCase = true) ||
+            html.contains("id=\"challenge-stage\"", ignoreCase = true) ||
             html.contains("/cdn-cgi/challenge-platform/", ignoreCase = true) ||
             html.contains("Enable JavaScript and cookies to continue", ignoreCase = true) ||
             html.contains("Verify you are human by completing the action", ignoreCase = true) ||
-            html.contains("تحقق من أنك إنسان", ignoreCase = true) ||
+            html.contains("يتم الآن التحقق من أنك إنسان", ignoreCase = true) ||
+            html.contains("مراجعة أمان اتصالك", ignoreCase = true) ||
             html.contains("يرجى التحقق من أنك إنسان", ignoreCase = true)
     }
 
@@ -3119,20 +3139,24 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_CATALOG = """
         (function() {
             var title = document.title || "";
-            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : "";
-            var isCf = title.indexOf("Just a moment") !== -1 ||
-                       title.indexOf("Attention Required") !== -1 ||
-                       title.indexOf("DDOS-GUARD") !== -1 ||
-                       bodyTxt.indexOf("Verify you are human") !== -1 ||
-                       bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
-                       bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
-                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage");
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1500) : "";
+            var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
+                             title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("Attention Required") !== -1 ||
+                             title.indexOf("DDOS-GUARD") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form");
+            var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
+                            bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
             var items = [];
             var seen = {};
             var selectors = [
                 ".page-item-detail", ".c-tabs-item__content", ".bs .bsx", ".bs", ".listupd .utao",
                 ".box", ".manga__item", ".series-card", ".animepost", "article", ".item", ".post-item",
-                ".manga-card", ".serie-card", ".grid-item", ".card", ".gallery"
+                ".manga-card", ".serie-card", ".grid-item", ".card", ".gallery", ".manga-item",
+                ".book-item", ".entry-item", ".thumb-item", ".group"
             ];
             var cards = document.querySelectorAll(selectors.join(","));
             function getImgUrl(el) {
@@ -3140,14 +3164,23 @@ object LiveMangaSiteScraper {
                 var img = el.tagName === "IMG" ? el : el.querySelector("img");
                 if (img) {
                     var src = img.getAttribute("data-src") || img.getAttribute("data-lazy-src") ||
-                              img.getAttribute("data-original") || img.currentSrc || img.src || "";
+                              img.getAttribute("data-original") || img.getAttribute("data-url") ||
+                              img.getAttribute("data-cfsrc") || img.currentSrc || img.src || "";
+                    if ((!src || src.indexOf("data:image") === 0) && img.getAttribute("srcset")) {
+                        src = img.getAttribute("srcset").split(",")[0].trim().split(" ")[0];
+                    }
+                    if ((!src || src.indexOf("data:image") === 0) && img.getAttribute("data-srcset")) {
+                        src = img.getAttribute("data-srcset").split(",")[0].trim().split(" ")[0];
+                    }
                     if (src && src.indexOf("data:image") === -1) return src;
                 }
-                var bgEl = el.querySelector("[style*='background-image']") || el;
-                var style = window.getComputedStyle(bgEl).backgroundImage;
-                if (style && style !== "none" && style.indexOf("url(") !== -1) {
-                    return style.replace(/^url\(["']?/, "").replace(/["']?\)$/, "");
-                }
+                var bgEl = el.querySelector ? (el.querySelector("[style*='background-image']") || el) : el;
+                try {
+                    var style = window.getComputedStyle(bgEl).backgroundImage;
+                    if (style && style !== "none" && style.indexOf("url(") !== -1) {
+                        return style.replace(/^url\(["']?/, "").replace(/["']?\)$/, "");
+                    }
+                } catch (e) {}
                 return "";
             }
             for (var i = 0; i < cards.length; i++) {
@@ -3158,17 +3191,17 @@ object LiveMangaSiteScraper {
                 if (seen[href]) continue;
                 var imgUrl = getImgUrl(c);
                 if (!imgUrl) continue;
-                var heading = c.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name, .caption");
+                var heading = c.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name, .caption, .series-title");
                 var t = (heading ? heading.innerText : (a.getAttribute("title") || a.innerText || "")).trim();
                 if (!t) {
                     var im = c.querySelector("img[alt]");
-                    if (im) t = im.getAttribute("alt").trim();
+                    if (im) t = (im.getAttribute("alt") || "").trim();
                 }
                 var genres = [];
-                var gNodes = c.querySelectorAll(".genres a, .mgen a, .genre a, .tags a, .cat a, a[href*='genre']");
+                var gNodes = c.querySelectorAll(".genres a, .mgen a, .genre a, .tags a, .cat a, a[href*='genre'], a[href*='tag']");
                 for (var g = 0; g < gNodes.length; g++) {
                     var gt = (gNodes[g].innerText || "").trim();
-                    if (gt && gt.length >= 2 && gt.length <= 18 && genres.indexOf(gt) === -1) {
+                    if (gt && gt.length >= 2 && gt.length <= 20 && genres.indexOf(gt) === -1) {
                         genres.push(gt);
                     }
                 }
@@ -3177,27 +3210,71 @@ object LiveMangaSiteScraper {
                     items.push({ title: t.split("\n")[0].trim(), url: href, cover: imgUrl, genres: genres.slice(0, 4) });
                 }
             }
-            return JSON.stringify({ cf: isCf, count: items.length, items: items.slice(0, 80) });
+            // Universal fallback for Tailwind / custom sites (e.g. hentairead.com) where cards don't use standard WP class names
+            if (items.length < 4) {
+                var allLinks = document.querySelectorAll("a[href]");
+                for (var k = 0; k < allLinks.length; k++) {
+                    var link = allLinks[k];
+                    var lHref = link.href || "";
+                    if (!lHref || seen[lHref] || lHref.indexOf("javascript:") === 0) continue;
+                    if (link.closest && link.closest("nav, header, footer, .pagination, .page-numbers")) continue;
+                    var container = (link.closest && link.closest("article, li, .group, .relative, div")) || link.parentElement || link;
+                    var lImg = getImgUrl(link) || getImgUrl(container);
+                    if (!lImg) continue;
+                    var lowerImg = lImg.toLowerCase();
+                    if (lowerImg.indexOf("logo") !== -1 || lowerImg.indexOf("avatar") !== -1 || lowerImg.indexOf("favicon") !== -1 || lowerImg.indexOf(".svg") !== -1) continue;
+                    var lTitle = (link.getAttribute("title") || "").trim();
+                    if (!lTitle) {
+                        var hEl = (link.querySelector && link.querySelector("h2, h3, h4, h5, .title, .name, span")) ||
+                                  (container && container.querySelector && container.querySelector("h2, h3, h4, h5, .title, .name, a[title]"));
+                        if (hEl) lTitle = (hEl.getAttribute("title") || hEl.innerText || "").trim();
+                    }
+                    if (!lTitle) {
+                        var imgEl = (link.querySelector && link.querySelector("img[alt]")) || (container && container.querySelector && container.querySelector("img[alt]"));
+                        if (imgEl) lTitle = (imgEl.getAttribute("alt") || "").trim();
+                    }
+                    if (!lTitle) {
+                        lTitle = (link.innerText || (container ? container.innerText : "") || "").trim();
+                    }
+                    lTitle = lTitle.split("\n")[0].trim();
+                    if (lTitle && lTitle.length >= 2) {
+                        seen[lHref] = true;
+                        items.push({ title: lTitle, url: lHref, cover: lImg, genres: [] });
+                    }
+                }
+            }
+            var isCf = hasCfTitle || hasCfStage || (hasCfBody && items.length === 0);
+            var rawHtml = (!isCf && document.documentElement) ? document.documentElement.outerHTML.slice(0, 450000) : "";
+            return JSON.stringify({
+                cf: isCf,
+                pageUrl: window.location.href || "",
+                count: items.length,
+                items: items.slice(0, 100),
+                html: rawHtml
+            });
         })();
     """.trimIndent()
 
     val JS_EXTRACT_LATEST_UPDATES = """
         (function() {
             var title = document.title || "";
-            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : "";
-            var isCf = title.indexOf("Just a moment") !== -1 ||
-                       title.indexOf("Attention Required") !== -1 ||
-                       title.indexOf("DDOS-GUARD") !== -1 ||
-                       bodyTxt.indexOf("Verify you are human") !== -1 ||
-                       bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
-                       bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
-                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage");
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1500) : "";
+            var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
+                             title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("Attention Required") !== -1 ||
+                             title.indexOf("DDOS-GUARD") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form");
+            var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
+                            bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
             var updates = [];
             var seen = {};
             var selectors = [
                 ".page-item-detail", ".c-tabs-item__content", ".utao", ".bsx", ".bs",
                 ".manga__item", ".post-item", ".series-card", ".animepost", ".latest-item",
-                ".update-item", ".box", ".manga-card", ".serie-card", "article", ".card", ".gallery"
+                ".update-item", ".box", ".manga-card", ".serie-card", "article", ".card", ".gallery", ".group"
             ];
             var cards = document.querySelectorAll(selectors.join(","));
             for (var i = 0; i < cards.length; i++) {
@@ -3207,7 +3284,7 @@ object LiveMangaSiteScraper {
                 var workUrl = a.href;
                 if (seen[workUrl]) continue;
                 var img = c.querySelector("img");
-                var cover = img ? (img.getAttribute("data-src") || img.getAttribute("data-lazy-src") || img.currentSrc || img.src || "") : "";
+                var cover = img ? (img.getAttribute("data-src") || img.getAttribute("data-lazy-src") || img.getAttribute("data-original") || img.currentSrc || img.src || "") : "";
                 if (!cover) continue;
                 var heading = c.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name, .caption");
                 var wTitle = (heading ? heading.innerText : (a.getAttribute("title") || "")).trim();
@@ -3228,21 +3305,31 @@ object LiveMangaSiteScraper {
                     date: dateTxt
                 });
             }
-            return JSON.stringify({ cf: isCf, updates: updates.slice(0, 60) });
+            var isCf = hasCfTitle || hasCfStage || (hasCfBody && updates.length === 0);
+            var rawHtml = (!isCf && document.documentElement) ? document.documentElement.outerHTML.slice(0, 450000) : "";
+            return JSON.stringify({
+                cf: isCf,
+                pageUrl: window.location.href || "",
+                updates: updates.slice(0, 80),
+                html: rawHtml
+            });
         })();
     """.trimIndent()
 
     val JS_EXTRACT_DETAILS = """
         (function() {
             var title = document.title || "";
-            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : "";
-            var isCf = title.indexOf("Just a moment") !== -1 ||
-                       title.indexOf("Attention Required") !== -1 ||
-                       title.indexOf("DDOS-GUARD") !== -1 ||
-                       bodyTxt.indexOf("Verify you are human") !== -1 ||
-                       bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
-                       bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
-                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage");
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1500) : "";
+            var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
+                             title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("Attention Required") !== -1 ||
+                             title.indexOf("DDOS-GUARD") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form");
+            var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
+                            bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
             try {
                 var moreBtns = document.querySelectorAll(".chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters");
                 for (var m = 0; m < moreBtns.length; m++) {
@@ -3339,25 +3426,30 @@ object LiveMangaSiteScraper {
             }
             var galleryPages = [];
             if (chapters.length === 0) {
-                var thumbImgs = document.querySelectorAll("#thumbnail-container img, .thumbnail-container img, .thumb-container img, .gallerythumb img, .gallery-thumbs img, .gdt img, .preview-grid img, .reading-content img, #readerarea img");
+                var thumbImgs = document.querySelectorAll("#thumbnail-container img, .thumbnail-container img, .thumb-container img, .gallerythumb img, .gallery-thumbs img, .gdt img, .preview-grid img, .reading-content img, #readerarea img, .gallery img, main img, article img");
                 var seenG = {};
                 for (var gi = 0; gi < thumbImgs.length; gi++) {
                     var gim = thumbImgs[gi];
+                    if (gim.closest && gim.closest("nav, header, footer, .related-manga, .comments-area, #comments")) continue;
                     var gsrc = gim.getAttribute("data-src") || gim.getAttribute("data-lazy-src") || gim.getAttribute("data-original") || gim.currentSrc || gim.src || "";
-                    if (gsrc && gsrc.indexOf("data:image") === -1 && !seenG[gsrc]) {
+                    if (gsrc && gsrc.indexOf("data:image") === -1 && gsrc.toLowerCase().indexOf("logo") === -1 && gsrc.toLowerCase().indexOf("avatar") === -1 && !seenG[gsrc]) {
                         seenG[gsrc] = true;
                         galleryPages.push(gsrc);
                     }
                 }
             }
+            var isCf = hasCfTitle || hasCfStage || (hasCfBody && chapters.length === 0 && galleryPages.length === 0);
+            var rawHtml = (!isCf && document.documentElement) ? document.documentElement.outerHTML.slice(0, 450000) : "";
             return JSON.stringify({
                 cf: isCf,
+                pageUrl: window.location.href || "",
                 title: workTitle,
                 cover: cover,
                 desc: desc,
                 genres: genres.slice(0, 8),
                 chapters: chapters.slice(0, 1500),
-                galleryPages: galleryPages.slice(0, 500)
+                galleryPages: galleryPages.slice(0, 500),
+                html: rawHtml
             });
         })();
     """.trimIndent()
@@ -3365,14 +3457,17 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_CHAPTER_PAGES = """
         (function() {
             var title = document.title || "";
-            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : "";
-            var isCf = title.indexOf("Just a moment") !== -1 ||
-                       title.indexOf("Attention Required") !== -1 ||
-                       title.indexOf("DDOS-GUARD") !== -1 ||
-                       bodyTxt.indexOf("Verify you are human") !== -1 ||
-                       bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
-                       bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
-                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage");
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1500) : "";
+            var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
+                             title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("Attention Required") !== -1 ||
+                             title.indexOf("DDOS-GUARD") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form");
+            var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
+                            bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
             var urls = [];
             var seen = {};
             function isInvalidImg(u, el) {
@@ -3462,7 +3557,14 @@ object LiveMangaSiteScraper {
                     addUrl(src2, im2);
                 }
             }
-            return JSON.stringify({ cf: isCf, pages: urls });
+            var isCf = hasCfTitle || hasCfStage || (hasCfBody && urls.length === 0);
+            var rawHtml = (!isCf && document.documentElement) ? document.documentElement.outerHTML.slice(0, 450000) : "";
+            return JSON.stringify({
+                cf: isCf,
+                pageUrl: window.location.href || "",
+                pages: urls,
+                html: rawHtml
+            });
         })();
     """.trimIndent()
 
@@ -3474,14 +3576,19 @@ object LiveMangaSiteScraper {
         return try {
             val obj = JSONObject(unwrapped)
             val isCf = obj.optBoolean("cf", false)
+            val pageUrl = obj.optString("pageUrl").trim().ifBlank { site.url }
+            val effectiveBaseUrl = if (pageUrl.startsWith("http")) pageUrl else site.url
             val arr = obj.optJSONArray("items") ?: JSONArray()
             val list = mutableListOf<MangaWork>()
+            val seenUrls = HashSet<String>()
             for (i in 0 until arr.length()) {
                 val item = arr.getJSONObject(i)
-                val url = resolveUrl(site.url, item.optString("url"))
-                val cover = resolveUrl(site.url, item.optString("cover"))
+                val url = resolveUrl(effectiveBaseUrl, item.optString("url"))
+                val cover = resolveUrl(effectiveBaseUrl, item.optString("cover"))
                 val title = cleanMangaTitle(item.optString("title"))
-                if (url.isNotBlank() && title.isNotBlank() && isLikelyMangaWorkUrl(url, site.url)) {
+                val normKey = normalizeChapterUrlKey(url)
+                if (url.isNotBlank() && title.isNotBlank() && normKey !in seenUrls && isLikelyMangaWorkUrl(url, site.url)) {
+                    seenUrls.add(normKey)
                     val id = slugFromUrl(url)
                     val gArr = item.optJSONArray("genres")
                     val genres = mutableListOf<String>()
@@ -3505,6 +3612,17 @@ object LiveMangaSiteScraper {
                     )
                 }
             }
+            val rawHtml = obj.optString("html")
+            if (rawHtml.isNotBlank() && list.size < 12) {
+                val htmlWorks = parseCatalogHtml(rawHtml, site)
+                for (hw in htmlWorks) {
+                    val normKey = normalizeChapterUrlKey(hw.mangaUrl)
+                    if (normKey.isNotBlank() && normKey !in seenUrls) {
+                        seenUrls.add(normKey)
+                        list.add(hw)
+                    }
+                }
+            }
             if (list.isNotEmpty()) {
                 cacheCatalogWorks(site.id, list)
             }
@@ -3522,18 +3640,23 @@ object LiveMangaSiteScraper {
         return try {
             val obj = JSONObject(unwrapped)
             val isCf = obj.optBoolean("cf", false)
+            val pageUrl = obj.optString("pageUrl").trim().ifBlank { site.url }
+            val effectiveBaseUrl = if (pageUrl.startsWith("http")) pageUrl else site.url
             val arr = obj.optJSONArray("updates") ?: JSONArray()
             val list = mutableListOf<MangaLatestUpdateItem>()
+            val seenWorkKeys = HashSet<String>()
             val now = System.currentTimeMillis()
             for (i in 0 until arr.length()) {
                 val item = arr.getJSONObject(i)
-                val workUrl = resolveUrl(site.url, item.optString("workUrl"))
-                val cover = resolveUrl(site.url, item.optString("cover"))
+                val workUrl = resolveUrl(effectiveBaseUrl, item.optString("workUrl"))
+                val cover = resolveUrl(effectiveBaseUrl, item.optString("cover"))
                 val workTitle = cleanMangaTitle(item.optString("workTitle"))
-                val chUrl = resolveUrl(site.url, item.optString("chUrl")).ifBlank { workUrl }
+                val chUrl = resolveUrl(effectiveBaseUrl, item.optString("chUrl")).ifBlank { workUrl }
                 val rawChTitle = item.optString("chTitle").ifBlank { "الفصل 1" }
                 val dateTxt = item.optString("date").ifBlank { "حديثاً" }
-                if (workUrl.isNotBlank() && workTitle.isNotBlank()) {
+                val normWorkKey = normalizeChapterUrlKey(workUrl)
+                if (workUrl.isNotBlank() && workTitle.isNotBlank() && isLikelyMangaWorkUrl(workUrl, site.url) && normWorkKey !in seenWorkKeys) {
+                    seenWorkKeys.add(normWorkKey)
                     val workId = slugFromUrl(workUrl)
                     val separated = separateTitleAndEmbeddedDate(rawChTitle, dateTxt, chUrl, workUrl)
                     val numInfo = parseChapterNumberInfo(separated.cleanTitle, rawChTitle, chUrl, workUrl, fallback = 1)
@@ -3562,6 +3685,17 @@ object LiveMangaSiteScraper {
                             syncedAt = now
                         )
                     )
+                }
+            }
+            val rawHtml = obj.optString("html")
+            if (rawHtml.isNotBlank() && list.size < 8) {
+                val htmlUpdates = parseLatestUpdatesHtml(rawHtml, site, effectiveBaseUrl)
+                for (hu in htmlUpdates) {
+                    val normKey = normalizeChapterUrlKey(hu.mangaUrl)
+                    if (normKey.isNotBlank() && normKey !in seenWorkKeys) {
+                        seenWorkKeys.add(normKey)
+                        list.add(hu)
+                    }
                 }
             }
             LatestUpdatesScrapeResult(
@@ -3670,7 +3804,7 @@ object LiveMangaSiteScraper {
                     }
                 }
             }
-            val updated = baseWork.copy(
+            var updated = baseWork.copy(
                 title = title,
                 status = normalizeStatusArabic(baseWork.status),
                 coverImageUrl = cover.ifBlank { baseWork.coverImageUrl },
@@ -3680,7 +3814,20 @@ object LiveMangaSiteScraper {
                 chaptersCount = if (sortedChapters.isNotEmpty()) sortedChapters.size else baseWork.chaptersCount,
                 isDetailsLoaded = true
             )
-            DetailsScrapeResult(work = updated, requiresCloudflare = isCf && sortedChapters.isEmpty())
+            val rawHtml = obj.optString("html")
+            if (rawHtml.isNotBlank()) {
+                val effectivePageUrl = obj.optString("pageUrl").trim().ifBlank { updated.mangaUrl.ifBlank { updated.siteUrl } }
+                val htmlParsed = parseMangaDetailsHtml(rawHtml, updated, effectivePageUrl)
+                if (htmlParsed.chapters.size > updated.chapters.size) {
+                    updated = htmlParsed
+                } else if (updated.description == "لا يوجد وصف متاح لهذا العمل." && htmlParsed.description.isNotBlank()) {
+                    updated = updated.copy(description = htmlParsed.description)
+                }
+            }
+            if (updated.chapters.isNotEmpty()) {
+                cacheWorkDetails(updated)
+            }
+            DetailsScrapeResult(work = updated, requiresCloudflare = isCf && updated.chapters.isEmpty())
         } catch (_: Exception) {
             DetailsScrapeResult(baseWork)
         }
@@ -3707,6 +3854,12 @@ object LiveMangaSiteScraper {
                 } else if (u.isNotBlank()) {
                     diagnostics.add(PageCandidateDiagnostic(u, u, "dom-bridge", "js", false, rejection))
                 }
+            }
+            val rawHtml = obj.optString("html")
+            if (rawHtml.isNotBlank() && urls.isEmpty()) {
+                val htmlRes = parseChapterPagesWithDiagnostics(rawHtml, chapterUrl)
+                urls.addAll(htmlRes.pageUrls)
+                diagnostics.addAll(htmlRes.diagnostics)
             }
             if (urls.isNotEmpty()) {
                 cacheChapterPages(chapterUrl, urls.toList())
@@ -3905,22 +4058,41 @@ object LiveMangaSiteScraper {
     }
 
     private fun isLikelyMangaWorkUrl(url: String, siteUrl: String): Boolean {
-        val lower = url.lowercase(Locale.ROOT)
-        val baseLower = siteUrl.trimEnd('/').lowercase(Locale.ROOT)
-        if (lower == baseLower || lower == "$baseLower/") return false
+        val lower = decodeUrlSafe(url).lowercase(Locale.ROOT).trim()
+        val normUrl = normalizeChapterUrlKey(lower)
+        val normBase = normalizeChapterUrlKey(decodeUrlSafe(siteUrl))
+        if (normUrl.isBlank() || normUrl == normBase) return false
         val rejectedSegments = listOf(
             "/wp-login", "/wp-admin", "/login", "/register", "/contact", "/privacy",
-            "/terms", "/dmca", "/discord", "/facebook", "/twitter", "/tag/", "/manga-genre/",
-            "/genre/", "/page/", "?s=", "/author/", "/artist/", "/bookmark", "/history"
+            "/terms", "/dmca", "/discord", "/facebook", "/twitter", "/tag/", "/tags/",
+            "/manga-genre/", "/genre/", "/genres/", "/category/", "/categories/",
+            "/collection/", "/collections/", "/page/", "?s=", "?page=", "/author/",
+            "/authors/", "/artist/", "/artists/", "/parody/", "/parodies/", "/character/",
+            "/characters/", "/group/", "/groups/", "/language/", "/languages/",
+            "/bookmark", "/history", "/popular", "/latest", "/trending", "/random",
+            "/search", "/about", "/faq", "/list", "/az-list", "/alphabet"
         )
         if (rejectedSegments.any { lower.contains(it) }) return false
         if (Regex("""/(?:chapter|ch|فصل|الفصل)[-_/\d]""").containsMatchIn(lower)) return false
-        return lower.contains("/manga/") ||
+        if (lower.contains("/manga/") ||
             lower.contains("/series/") ||
             lower.contains("/work/") ||
             lower.contains("/comic/") ||
             lower.contains("/manhwa/") ||
-            lower.startsWith(baseLower)
+            lower.contains("/manhua/") ||
+            lower.contains("/webtoon/") ||
+            lower.contains("/hentai/") ||
+            lower.contains("/doujinshi/") ||
+            lower.contains("/doujin/") ||
+            lower.contains("/gallery/") ||
+            lower.contains("/g/")
+        ) {
+            return true
+        }
+        val urlHost = runCatching { URI(url).host?.lowercase(Locale.ROOT)?.removePrefix("www.").orEmpty() }.getOrDefault("")
+        val siteHost = runCatching { URI(siteUrl).host?.lowercase(Locale.ROOT)?.removePrefix("www.").orEmpty() }.getOrDefault("")
+        val urlPath = runCatching { URI(url).path?.trim('/').orEmpty() }.getOrDefault("")
+        return (urlHost.isNotBlank() && urlHost == siteHost && urlPath.length >= 2) || lower.startsWith(normBase)
     }
 
     private fun decodeUrlSafe(url: String): String {

@@ -132,5 +132,41 @@ class ExampleUnitTest {
         assertEquals("https://i3.nhentai.net/galleries/2999111/1.jpg", galleryPages.first())
         assertEquals("https://i3.nhentai.net/galleries/2999111/12.jpg", galleryPages.last())
     }
+
+    @Test
+    fun parseCatalogHtml_handlesCustomHentaiPathsAndWwwNormalization() {
+        val site = com.example.data.local.SiteEntity(
+            id = 77L,
+            name = "HentaiRead",
+            url = "https://hentairead.com",
+            domain = "hentairead.com",
+            iconKey = "globe"
+        )
+        val html = """
+            <html>
+            <body>
+                <div class="grid">
+                    <a href="https://www.hentairead.com/hentai/blue-archive-special/" title="Blue Archive Special">
+                        <img src="https://www.hentairead.com/wp-content/uploads/cover1.webp" alt="Blue Archive Special" />
+                    </a>
+                    <a href="https://hentairead.com/manga/crimson-knight/" title="Crimson Knight">
+                        <img src="https://hentairead.com/wp-content/uploads/cover2.webp" alt="Crimson Knight" />
+                    </a>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
+
+        val works = LiveMangaSiteScraper.parseCatalogHtml(html, site, "https://www.hentairead.com/")
+        assertEquals(2, works.size)
+        assertEquals("Blue Archive Special", works[0].title)
+        assertEquals("Crimson Knight", works[1].title)
+
+        // Verify Arabic Cloudflare interstitial detection
+        val cfArabicHtml = "<html><head><title>انتظر لحظة...</title></head><body>يتم الآن التحقق من أنك إنسان. قد يستغرق هذا بضع ثوانٍ.</body></html>"
+        assertTrue(LiveMangaSiteScraper.isCloudflareChallengeHtml(cfArabicHtml, 403))
+    }
 }
+
+
 
