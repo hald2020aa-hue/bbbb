@@ -2,7 +2,7 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "**" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
@@ -35,11 +35,8 @@ jobs:
           printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n504667f4c0de7af1a06de9f4b1727b84351f2910\n" > "$ANDROID_SDK_ROOT/licenses/android-sdk-preview-license"
           SDKMANAGER=$(find "$ANDROID_SDK_ROOT" -name sdkmanager -type f | sort -V | tail -n 1)
           if [ -n "$SDKMANAGER" ]; then
-            yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-            "$SDKMANAGER" --install "platform-tools" > /dev/null 2>&1 || true
-            "$SDKMANAGER" --install "build-tools;36.0.0" > /dev/null 2>&1 || true
-            "$SDKMANAGER" --install "platforms;android-36" > /dev/null 2>&1 || true
-            "$SDKMANAGER" --install "platforms;android-36.1" > /dev/null 2>&1 || true
+            yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null 2>&1 || true
+            "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --install "platform-tools" "build-tools;36.0.0" "platforms;android-36" "platforms;android-36.1" > /dev/null 2>&1 || true
           fi
 
       - name: Prepare .env and debug.keystore
@@ -92,3 +89,15 @@ jobs:
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/manga-sites-reader-debug.apk
           if-no-files-found: error
+
+      - name: Publish APK to GitHub Releases
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="v2.0.7-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG_NAME" \
+            app/build/outputs/apk/debug/manga-sites-reader-debug.apk \
+            --title "إصدار مكتبة المانجا والمواقع ($TAG_NAME)" \
+            --notes "نسخة APK جاهزة للتثبيت المباشر على أندرويد (تم بناؤها تلقائياً عبر GitHub Actions)." || true
+
