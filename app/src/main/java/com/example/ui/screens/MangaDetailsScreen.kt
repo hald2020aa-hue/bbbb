@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -61,6 +62,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -96,6 +99,7 @@ import com.example.data.local.SiteEntity
 import com.example.ui.components.CloudflareProtectionDialog
 import com.example.ui.components.HiddenSiteWebViewBridge
 import com.example.ui.components.MangaCoverArtwork
+import com.example.ui.components.ShimmerChaptersList
 import com.example.ui.components.SiteIconBadge
 import com.example.ui.components.rememberDynamicCoverPalette
 import com.example.ui.theme.AppBackgroundDark
@@ -162,6 +166,9 @@ fun MangaDetailsScreen(
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
     var isChaptersReversed by remember { mutableStateOf(false) }
+    var chapterFilterMode by remember { mutableStateOf("الكل") } // الكل | غير المقروءة | المحملة
+    var chapterJumpQuery by remember { mutableStateOf("") }
+    val chaptersListState = rememberLazyListState()
     var activeChapterMenuId by remember { mutableStateOf<String?>(null) }
     var showOverflowMenu by remember { mutableStateOf(false) }
     var showSearchInSitesDialog by remember { mutableStateOf(false) }
@@ -795,43 +802,11 @@ fun MangaDetailsScreen(
                     .fillMaxWidth()
             ) {
                 if (isLoadingChapters && displayedChapters.isEmpty()) {
-                    // Skeleton Loading State matching 00:16 - 00:24
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        repeat(6) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(30.dp)
-                                        .clip(CircleShape)
-                                        .background(Color(0xFF282C37))
-                                )
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(26.dp)
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(Color(0xFF282C37))
-                                )
-                            }
-                        }
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = null,
-                            tint = Color(0xFF8C92A4),
-                            modifier = Modifier.size(48.dp)
-                        )
-                    }
+                    // Shimmer Skeleton Loading State
+                    ShimmerChaptersList(
+                        itemCount = 7,
+                        modifier = Modifier.fillMaxSize()
+                    )
                 } else if (displayedChapters.isEmpty()) {
                     Column(
                         modifier = Modifier
@@ -876,18 +851,123 @@ fun MangaDetailsScreen(
                     val hasOnlyLocalChapters = liveWork.isFromLocalStorage &&
                         savedOfflineChapters.isNotEmpty() &&
                         (savedOfflineChapters.size + incompleteStorageChapters.size == displayedChapters.size)
-                    val chaptersToDisplay = if (hasOnlyLocalChapters) {
+                    val baseChaptersToDisplay = if (hasOnlyLocalChapters) {
                         savedOfflineChapters
                     } else {
                         displayedChapters
                     }
-
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .testTag("chapters_lazy_column"),
-                        contentPadding = PaddingValues(vertical = 6.dp)
+                    val chaptersToDisplay = remember(
+                        baseChaptersToDisplay,
+                        chapterFilterMode,
+                        chapterJumpQuery,
+                        readChapterNumbers,
+                        downloadedChapterNumbers,
+                        chapterDownloadStates
                     ) {
+                        val modeFiltered = when (chapterFilterMode) {
+                            "غير المقروءة" -> baseChaptersToDisplay.filter { ch ->
+                                ch.number !in readChapterNumbers && !ch.isRead
+                            }
+                            "المحملة" -> baseChaptersToDisplay.filter { ch ->
+                                val st = chapterDownloadStates[ch.number]?.status?.ifBlank { ch.downloadStatus } ?: ch.downloadStatus
+                                (ch.number in downloadedChapterNumbers) || (ch.isDownloaded && st == "COMPLETED") || (ch.localPagePaths.isNotEmpty() && st == "COMPLETED")
+                            }
+                            else -> baseChaptersToDisplay
+                        }
+                        val cleanJump = chapterJumpQuery.trim()
+                        if (cleanJump.isEmpty()) {
+                            modeFiltered
+                        } else {
+                            modeFiltered.filter { ch ->
+                                ch.number.toString().contains(cleanJump) ||
+                                    ch.numberLabel.contains(cleanJump, ignoreCase = true) ||
+                                    ch.title.contains(cleanJump, ignoreCase = true)
+                            }
+                        }
+                    }
+
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        // Fast Filter Chips & Quick Chapter Jump Bar
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            listOf("الكل", "غير المقروءة", "المحملة").forEach { filterOption ->
+                                val selected = chapterFilterMode == filterOption
+                                Surface(
+                                    color = if (selected) PeriwinklePrimary else Color(0xFF232734),
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier
+                                        .clickable { chapterFilterMode = filterOption }
+                                        .testTag("chapter_filter_chip_$filterOption")
+                                ) {
+                                    Text(
+                                        text = filterOption,
+                                        color = if (selected) PeriwinkleOnPrimary else TextSecondaryGrey,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.weight(1f))
+                            if (chaptersToDisplay.size > 8) {
+                                Surface(
+                                    color = Color(0xFF232734),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.clickable {
+                                        scope.launch {
+                                            val lastIdx = (chaptersToDisplay.size - 1).coerceAtLeast(0)
+                                            val currentFirst = chaptersListState.firstVisibleItemIndex
+                                            if (currentFirst < lastIdx / 2) {
+                                                chaptersListState.animateScrollToItem(lastIdx)
+                                            } else {
+                                                chaptersListState.animateScrollToItem(0)
+                                            }
+                                        }
+                                    }
+                                ) {
+                                    Text(
+                                        text = "↕ انتقال سريع",
+                                        color = PeriwinklePrimary,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        if (baseChaptersToDisplay.size >= 6) {
+                            OutlinedTextField(
+                                value = chapterJumpQuery,
+                                onValueChange = { chapterJumpQuery = it },
+                                placeholder = { Text("ابحث عن رقم الفصل...", fontSize = 11.sp) },
+                                singleLine = true,
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = PeriwinklePrimary,
+                                    unfocusedBorderColor = Color(0xFF323746),
+                                    focusedTextColor = TextPrimaryWhite,
+                                    unfocusedTextColor = TextPrimaryWhite
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 8.dp, vertical = 2.dp)
+                                    .testTag("chapter_jump_input")
+                            )
+                        }
+
+                        LazyColumn(
+                            state = chaptersListState,
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .testTag("chapters_lazy_column"),
+                            contentPadding = PaddingValues(vertical = 6.dp)
+                        ) {
                         if (liveWork.isFromLocalStorage && savedOfflineChapters.isNotEmpty()) {
                             item(key = "completed_offline_header") {
                                 Text(
@@ -1281,6 +1361,7 @@ fun MangaDetailsScreen(
                                 }
                             }
                         }
+                        }
                     }
                 }
 
@@ -1613,6 +1694,30 @@ fun MangaDetailsScreen(
                     OutlinedButton(
                         onClick = {
                             showDownloadMangaDialog = false
+                            val target = unreadChapters.take(5).ifEmpty { sortedAsc.take(5) }
+                            onDownloadChapters(liveWork, target, "بدأ تنزيل أول 5 فصول غير مقروءة (${target.size} فصل) 😭")
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("batch_download_unread_5_btn")
+                    ) {
+                        Text("تنزيل أول 5 فصول غير مقروءة", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            showDownloadMangaDialog = false
+                            val target = unreadChapters.take(10).ifEmpty { sortedAsc.take(10) }
+                            onDownloadChapters(liveWork, target, "بدأ تنزيل العشر فصول القادمة غير المقروءة (${target.size} فصل) 😭")
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("batch_download_unread_10_btn")
+                    ) {
+                        Text("تنزيل العشر فصول القادمة غير المقروءة", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            showDownloadMangaDialog = false
                             val target = unreadChapters.ifEmpty { sortedAsc }
                             onDownloadChapters(liveWork, target, "بدأ تنزيل الفصول غير المقروءة (${target.size} فصل) 😭")
                         },
@@ -1620,7 +1725,7 @@ fun MangaDetailsScreen(
                             .fillMaxWidth()
                             .testTag("batch_download_unread_btn")
                     ) {
-                        Text("تنزيل الفصول غير المقروءة (${unreadChapters.size})", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                        Text("تنزيل جميع الفصول غير المقروءة (${unreadChapters.size})", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
                     }
                     OutlinedButton(
                         onClick = {

@@ -1280,4 +1280,78 @@ class AppRepository(
             syncedAt = syncedAt
         )
     }
+
+    // ==================== INSTANT CHAPTER LIST CACHING (0ms LOAD) ====================
+
+    private val memoryWorkChaptersCache = java.util.concurrent.ConcurrentHashMap<String, List<MangaChapter>>()
+    private val diskChaptersCacheFile: File
+        get() = File(context.filesDir, "cached_work_chapters.json")
+
+    private fun buildWorkCacheKey(workId: String, mangaUrl: String): String {
+        val cleanUrl = mangaUrl.trim().trimEnd('/').lowercase(Locale.ROOT)
+        return cleanUrl.ifBlank { workId.trim().lowercase(Locale.ROOT) }
+    }
+
+    fun getCachedWorkChapters(workId: String, mangaUrl: String): List<MangaChapter> {
+        val key = buildWorkCacheKey(workId, mangaUrl)
+        if (key.isBlank()) return emptyList()
+        memoryWorkChaptersCache[key]?.let { if (it.isNotEmpty()) return it }
+        return runCatching {
+            if (!diskChaptersCacheFile.exists()) return emptyList()
+            val root = JSONObject(diskChaptersCacheFile.readText(Charsets.UTF_8))
+            val arr = root.optJSONArray(key) ?: root.optJSONArray(workId) ?: return emptyList()
+            val list = ArrayList<MangaChapter>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                list.add(
+                    MangaChapter(
+                        id = obj.optString("id"),
+                        number = obj.optInt("number", i + 1),
+                        title = obj.optString("title"),
+                        dateText = obj.optString("dateText"),
+                        chapterUrl = obj.optString("chapterUrl"),
+                        chapterNumberValue = obj.optDouble("chapterNumberValue", obj.optInt("number", i + 1).toDouble()),
+                        numberLabel = obj.optString("numberLabel", obj.optInt("number", i + 1).toString())
+                    )
+                )
+            }
+            if (list.isNotEmpty()) {
+                memoryWorkChaptersCache[key] = list
+            }
+            list
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun cacheWorkChapters(work: MangaWork) = withContext(Dispatchers.IO) {
+        if (work.chapters.isEmpty()) return@withContext
+        val key = buildWorkCacheKey(work.id, work.mangaUrl)
+        if (key.isBlank()) return@withContext
+        memoryWorkChaptersCache[key] = work.chapters
+        runCatching {
+            val root = if (diskChaptersCacheFile.exists()) {
+                runCatching { JSONObject(diskChaptersCacheFile.readText(Charsets.UTF_8)) }.getOrDefault(JSONObject())
+            } else {
+                JSONObject()
+            }
+            val arr = JSONArray()
+            work.chapters.take(500).forEach { ch ->
+                arr.put(
+                    JSONObject().apply {
+                        put("id", ch.id)
+                        put("number", ch.number)
+                        put("title", ch.title)
+                        put("dateText", ch.dateText)
+                        put("chapterUrl", ch.chapterUrl)
+                        put("chapterNumberValue", ch.chapterNumberValue)
+                        put("numberLabel", ch.numberLabel)
+                    }
+                )
+            }
+            root.put(key, arr)
+            if (work.id.isNotBlank()) {
+                root.put(work.id, arr)
+            }
+            diskChaptersCacheFile.writeText(root.toString(), Charsets.UTF_8)
+        }
+    }
 }

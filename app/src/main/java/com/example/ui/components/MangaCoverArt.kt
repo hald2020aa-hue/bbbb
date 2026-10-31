@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoStories
@@ -897,6 +898,62 @@ fun ShimmerUpdatesList(
                             .background(shimmerBrush)
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun ShimmerChaptersList(
+    itemCount: Int = 7,
+    modifier: Modifier = Modifier
+) {
+    val shimmerBrush = rememberShimmerBrush()
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+            .testTag("shimmer_chapters_list"),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        repeat(itemCount) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .background(shimmerBrush)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(0.72f)
+                            .height(14.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(shimmerBrush)
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(0.42f)
+                            .height(10.dp)
+                            .clip(RoundedCornerShape(5.dp))
+                            .background(shimmerBrush)
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(shimmerBrush)
+                )
             }
         }
     }

@@ -1856,7 +1856,24 @@ fun FavoritesScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(fav.title, color = TextPrimaryWhite, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(fav.title, color = TextPrimaryWhite, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                    Surface(
+                                        color = Color(0xFF1E392A),
+                                        shape = RoundedCornerShape(6.dp)
+                                    ) {
+                                        Text(
+                                            text = "متابعة الفصول ⚡",
+                                            color = Color(0xFF81C784),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
                                     text = "${fav.siteName.ifBlank { "المكتبة" }} • الفئة: ${fav.category}",

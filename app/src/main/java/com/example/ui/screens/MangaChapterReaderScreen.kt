@@ -278,6 +278,13 @@ fun MangaChapterReaderScreen(
     var localAutoScrollSpeed by remember(settings.autoScrollSpeed) {
         mutableFloatStateOf(settings.autoScrollSpeed.coerceIn(0.1f, 1.0f))
     }
+    var warmEyeDimmerLevel by remember {
+        mutableFloatStateOf(if (settings.readerColorFilter.contains("Sepia")) 0.35f else 0f)
+    }
+    var quickBrightnessLevel by remember(settings.customBrightnessLevel, settings.customBrightnessEnabled) {
+        mutableIntStateOf(if (settings.customBrightnessEnabled) settings.customBrightnessLevel.coerceIn(20, 100) else 100)
+    }
+    var isNextChapterPrefetched by remember(chapter.id) { mutableStateOf(false) }
     var isUserTouchingScreen by remember { mutableStateOf(false) }
     val readerFocusRequester = remember { FocusRequester() }
 
@@ -320,13 +327,13 @@ fun MangaChapterReaderScreen(
         }
     }
 
-    // Active lookahead prefetcher: preloads current + next 5 pages in background so scrolling has zero lag
+    // Active lookahead prefetcher: preloads previous 1 + current + next 5 pages in background so scrolling has zero lag
     LaunchedEffect(currentPageIndex, livePageUrls) {
         if (livePageUrls.isNotEmpty() && !isOfflineComplete) {
             val loader = com.example.ui.components.MangaCoilImageLoader.get(readerContext)
             val referer = targetChapterUrl.ifBlank { work.siteUrl }
-            val startIdx = currentPageIndex.coerceAtLeast(0)
-            val endIdx = (startIdx + 5).coerceAtMost(livePageUrls.lastIndex)
+            val startIdx = (currentPageIndex - 1).coerceAtLeast(0)
+            val endIdx = (currentPageIndex + 5).coerceAtMost(livePageUrls.lastIndex)
             for (idx in startIdx..endIdx) {
                 val url = livePageUrls.getOrNull(idx) ?: continue
                 if (url.startsWith("http")) {
@@ -394,6 +401,36 @@ fun MangaChapterReaderScreen(
     val nextChapter = remember(sortedWorkChapters, chapter.number) {
         sortedWorkChapters.firstOrNull { it.number > chapter.number }
             ?: work.chapters.find { it.number == chapter.number + 1 }
+    }
+
+    // Next Chapter Prefetching when reaching the last 20% of the current chapter
+    LaunchedEffect(currentPageIndex, totalPages, isChapterLoaded, nextChapter?.chapterUrl) {
+        val targetNext = nextChapter ?: return@LaunchedEffect
+        val thresholdIdx = ((totalPages - 1) * 0.8f).toInt().coerceAtLeast(0)
+        if (isChapterLoaded && !isNextChapterPrefetched && currentPageIndex >= thresholdIdx && targetNext.chapterUrl.startsWith("http")) {
+            isNextChapterPrefetched = true
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    val nextRes = LiveMangaSiteScraper.fetchChapterPages(work, targetNext)
+                    if (nextRes.pageUrls.isNotEmpty()) {
+                        LiveMangaSiteScraper.cacheChapterPages(targetNext.chapterUrl, nextRes.pageUrls)
+                        val loader = com.example.ui.components.MangaCoilImageLoader.get(readerContext)
+                        nextRes.pageUrls.take(3).forEach { nextImgUrl ->
+                            if (nextImgUrl.startsWith("http")) {
+                                val req = coil.request.ImageRequest.Builder(readerContext)
+                                    .data(nextImgUrl)
+                                    .setHeader("Referer", targetNext.chapterUrl)
+                                    .setHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent.replace("; wv", ""))
+                                    .memoryCacheKey(nextImgUrl)
+                                    .diskCacheKey(nextImgUrl)
+                                    .build()
+                                loader.enqueue(req)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fun scrollOrTurnNext() {
@@ -717,7 +754,12 @@ fun MangaChapterReaderScreen(
                                         ),
                                         modifier = Modifier.weight(1f)
                                     ) {
-                                        Text("الفصل التالي (${nextChapter.number})", fontWeight = FontWeight.Bold)
+                                        val nextLabel = if (isNextChapterPrefetched) {
+                                            "الفصل التالي (${nextChapter.number}) ⚡ جاهز"
+                                        } else {
+                                            "الفصل التالي (${nextChapter.number})"
+                                        }
+                                        Text(nextLabel, fontWeight = FontWeight.Bold)
                                     }
                                 }
                             }
@@ -861,6 +903,33 @@ fun MangaChapterReaderScreen(
                     ) {
                         Text("−", color = TextPrimaryWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     }
+                    // Quick 1-Tap Speed Presets: بطيء / متوسط / سريع
+                    listOf(
+                        "بطيء" to 0.25f,
+                        "متوسط" to 0.55f,
+                        "سريع" to 0.88f
+                    ).forEach { (presetLabel, presetVal) ->
+                        val isSelectedPreset = kotlin.math.abs(localAutoScrollSpeed - presetVal) < 0.14f
+                        Surface(
+                            color = if (isSelectedPreset) PeriwinklePrimary else Color(0xFF282D3C),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .clickable {
+                                    localAutoScrollSpeed = presetVal
+                                    onUpdateAutoScrollSpeed(presetVal)
+                                }
+                                .padding(vertical = 1.dp)
+                                .testTag("auto_scroll_preset_$presetLabel")
+                        ) {
+                            Text(
+                                text = presetLabel,
+                                color = if (isSelectedPreset) PeriwinkleOnPrimary else TextPrimaryWhite,
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
                     IconButton(
                         onClick = {
                             localAutoScroll = false
@@ -879,13 +948,20 @@ fun MangaChapterReaderScreen(
             }
         }
 
-        // Custom Brightness Dimming Overlay if enabled in settings
-        if (settings.customBrightnessEnabled) {
-            val dimAlpha = ((100 - settings.customBrightnessLevel).coerceIn(0, 80)) / 120f
+        // Custom Brightness Dimming & Warm Eye-Comfort Night Overlay
+        val effectiveDimAlpha = ((100 - quickBrightnessLevel).coerceIn(0, 80)) / 120f
+        if (effectiveDimAlpha > 0.01f) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = dimAlpha))
+                    .background(Color.Black.copy(alpha = effectiveDimAlpha))
+            )
+        }
+        if (warmEyeDimmerLevel > 0.01f) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xFFFF9800).copy(alpha = (warmEyeDimmerLevel * 0.28f).coerceIn(0f, 0.35f)))
             )
         }
 
@@ -1179,6 +1255,80 @@ fun MangaChapterReaderScreen(
                             color = TextPrimaryWhite,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    // Warm Night Eye-Comfort Dimmer Slider + Brightness Control
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "${(warmEyeDimmerLevel * 100).roundToInt()}%",
+                                color = Color(0xFFFFB74D),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "إضاءة ليلية دافئة (راحة العين)",
+                                color = TextPrimaryWhite,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Slider(
+                            value = warmEyeDimmerLevel,
+                            onValueChange = { warmEyeDimmerLevel = it },
+                            valueRange = 0f..1f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color(0xFFFFB74D),
+                                activeTrackColor = Color(0xFFFFB74D),
+                                inactiveTrackColor = Color(0xFF394054)
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(26.dp)
+                                .testTag("reader_warm_eye_slider")
+                        )
+
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "$quickBrightnessLevel%",
+                                color = PeriwinklePrimary,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "مستوى سطوع القارئ",
+                                color = TextPrimaryWhite,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Slider(
+                            value = quickBrightnessLevel.toFloat(),
+                            onValueChange = { quickBrightnessLevel = it.roundToInt().coerceIn(20, 100) },
+                            valueRange = 20f..100f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = PeriwinklePrimary,
+                                activeTrackColor = PeriwinklePrimary,
+                                inactiveTrackColor = Color(0xFF394054)
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(26.dp)
+                                .testTag("reader_quick_brightness_slider")
                         )
                     }
 

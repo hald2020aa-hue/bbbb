@@ -28,7 +28,10 @@ import com.example.data.preferences.UserSettingsDataStore
 import com.example.data.repository.AppRepository
 import com.example.data.repository.StorageStats
 import com.example.data.source.SourceCapabilities
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -36,6 +39,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import java.text.DecimalFormat
 
 enum class AppScreen {
@@ -371,16 +375,30 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
 
     fun openMangaDetails(work: MangaWork) {
         viewModelScope.launch {
+            val cachedRemoteChapters = if (work.chapters.isEmpty()) {
+                repository.getCachedWorkChapters(work.id, work.mangaUrl)
+            } else {
+                emptyList()
+            }
+            val seedWork = if (work.chapters.isEmpty() && cachedRemoteChapters.isNotEmpty()) {
+                work.copy(
+                    chapters = cachedRemoteChapters,
+                    chaptersCount = maxOf(work.chaptersCount, cachedRemoteChapters.size)
+                )
+            } else {
+                work
+            }
+
             // Merge any locally downloaded chapters for this work without wiping out remote chapters
-            val localWorkEntity = repository.dao.getDownloadedWorkById(work.id)
+            val localWorkEntity = repository.dao.getDownloadedWorkById(seedWork.id)
             val mergedWork = if (localWorkEntity != null) {
                 val offlineBuilt = repository.buildOfflineMangaWorkFromEntity(localWorkEntity)
                 val offlineChByNumber = offlineBuilt.chapters.associateBy { it.number }
-                val mergedChapters = if (work.chapters.isEmpty()) {
+                val mergedChapters = if (seedWork.chapters.isEmpty()) {
                     offlineBuilt.chapters
                 } else {
                     val map = LinkedHashMap<Int, MangaChapter>()
-                    for (ch in work.chapters) {
+                    for (ch in seedWork.chapters) {
                         val localCh = offlineChByNumber[ch.number]
                         if (localCh != null && (localCh.localPagePaths.isNotEmpty() || localCh.isDownloaded)) {
                             map[ch.number] = ch.copy(
@@ -408,21 +426,21 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
                             .thenBy { it.number }
                     )
                 }
-                work.copy(
-                    title = work.title.ifBlank { offlineBuilt.title },
-                    mangaUrl = work.mangaUrl.ifBlank { offlineBuilt.mangaUrl },
-                    siteUrl = work.siteUrl.ifBlank { offlineBuilt.siteUrl },
-                    siteName = work.siteName.ifBlank { offlineBuilt.siteName },
-                    coverImageUrl = work.coverImageUrl ?: offlineBuilt.coverImageUrl,
-                    description = work.description.ifBlank { offlineBuilt.description },
-                    genres = work.genres.ifEmpty { offlineBuilt.genres },
-                    localCoverPath = localWorkEntity.localCoverPath.ifBlank { work.localCoverPath },
-                    storageSizeBytes = localWorkEntity.totalStorageBytes.coerceAtLeast(work.storageSizeBytes),
+                seedWork.copy(
+                    title = seedWork.title.ifBlank { offlineBuilt.title },
+                    mangaUrl = seedWork.mangaUrl.ifBlank { offlineBuilt.mangaUrl },
+                    siteUrl = seedWork.siteUrl.ifBlank { offlineBuilt.siteUrl },
+                    siteName = seedWork.siteName.ifBlank { offlineBuilt.siteName },
+                    coverImageUrl = seedWork.coverImageUrl ?: offlineBuilt.coverImageUrl,
+                    description = seedWork.description.ifBlank { offlineBuilt.description },
+                    genres = seedWork.genres.ifEmpty { offlineBuilt.genres },
+                    localCoverPath = localWorkEntity.localCoverPath.ifBlank { seedWork.localCoverPath },
+                    storageSizeBytes = localWorkEntity.totalStorageBytes.coerceAtLeast(seedWork.storageSizeBytes),
                     chapters = mergedChapters,
-                    chaptersCount = maxOf(mergedChapters.size, work.chaptersCount, offlineBuilt.chaptersCount)
+                    chaptersCount = maxOf(mergedChapters.size, seedWork.chaptersCount, offlineBuilt.chaptersCount)
                 )
             } else {
-                work
+                seedWork
             }
 
             _selectedWork.value = mergedWork
@@ -447,6 +465,7 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
         }
         if (updatedWork.chapters.isNotEmpty()) {
             viewModelScope.launch {
+                repository.cacheWorkChapters(updatedWork)
                 val existingEntity = repository.dao.getDownloadedWorkById(updatedWork.id)
                 if (existingEntity != null && updatedWork.chapters.size > existingEntity.totalChaptersOnSite) {
                     repository.dao.upsertDownloadedWork(
@@ -945,7 +964,7 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
         repository.reorderDownloadTask(task, moveUp)
     }
 
-    // Unified Global Search & Source Migration
+    // Unified Global Search & Source Migration (Parallel Execution across all active sources)
     fun performGlobalSearch(query: String) {
         _globalSearchQuery.value = query
         val clean = query.trim()
@@ -957,17 +976,25 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
         recordSearchQuery()
         viewModelScope.launch {
             _isGlobalSearching.value = true
+            _globalSearchResultsBySite.value = emptyMap()
+            val resultsLock = Any()
             val results = LinkedHashMap<SiteEntity, List<MangaWork>>()
             val activeSites = enabledSites.value
-            for (site in activeSites) {
-                val scrapeRes = runCatching {
-                    LiveMangaSiteScraper.fetchSiteCatalog(site = site, searchQuery = clean)
-                }.getOrNull()
-                val works = scrapeRes?.works.orEmpty()
-                if (works.isNotEmpty()) {
-                    results[site] = works
-                    _globalSearchResultsBySite.value = results.toMap()
-                }
+            supervisorScope {
+                activeSites.map { site ->
+                    async(Dispatchers.IO) {
+                        val scrapeRes = runCatching {
+                            LiveMangaSiteScraper.fetchSiteCatalog(site = site, searchQuery = clean)
+                        }.getOrNull()
+                        val works = scrapeRes?.works.orEmpty()
+                        if (works.isNotEmpty()) {
+                            synchronized(resultsLock) {
+                                results[site] = works
+                                _globalSearchResultsBySite.value = LinkedHashMap(results)
+                            }
+                        }
+                    }
+                }.awaitAll()
             }
             _isGlobalSearching.value = false
         }
@@ -978,16 +1005,25 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
             _isSearchingMigration.value = true
             _migrationCandidates.value = emptyList()
             val query = work.title.trim()
+            val candidatesLock = Any()
             val candidates = mutableListOf<MangaWork>()
             val otherSites = enabledSites.value.filter { it.id != work.sourceId && it.name != work.siteName }
             val targetSites = if (otherSites.isNotEmpty()) otherSites else enabledSites.value
-            for (site in targetSites) {
-                val res = runCatching {
-                    LiveMangaSiteScraper.fetchSiteCatalog(site = site, searchQuery = query)
-                }.getOrNull()
-                val matched = res?.works.orEmpty().filter { it.mangaUrl != work.mangaUrl }
-                candidates.addAll(matched.take(6))
-                _migrationCandidates.value = candidates.toList()
+            supervisorScope {
+                targetSites.map { site ->
+                    async(Dispatchers.IO) {
+                        val res = runCatching {
+                            LiveMangaSiteScraper.fetchSiteCatalog(site = site, searchQuery = query)
+                        }.getOrNull()
+                        val matched = res?.works.orEmpty().filter { it.mangaUrl != work.mangaUrl }
+                        if (matched.isNotEmpty()) {
+                            synchronized(candidatesLock) {
+                                candidates.addAll(matched.take(6))
+                                _migrationCandidates.value = candidates.toList()
+                            }
+                        }
+                    }
+                }.awaitAll()
             }
             _isSearchingMigration.value = false
         }
