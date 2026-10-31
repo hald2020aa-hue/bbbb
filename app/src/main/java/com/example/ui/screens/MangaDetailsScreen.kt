@@ -138,16 +138,26 @@ fun MangaDetailsScreen(
     onRemoveWorkFromStorage: (String) -> Unit = {},
     onOpenInWebView: (String, String) -> Unit,
     onSelectSiteForSearch: ((SiteEntity) -> Unit)? = null,
+    onWorkDetailsUpdated: (MangaWork) -> Unit = {},
     onShowToast: (String) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    val targetMangaUrl = remember(work.mangaUrl, work.siteUrl, work.id) {
+        work.mangaUrl.ifBlank {
+            if (work.siteUrl.isNotBlank()) "${work.siteUrl.trimEnd('/')}/series/${work.id}" else ""
+        }
+    }
+    val hasValidRemoteUrl = remember(targetMangaUrl) {
+        targetMangaUrl.startsWith("http://", ignoreCase = true) || targetMangaUrl.startsWith("https://", ignoreCase = true)
+    }
+
     var liveWork by remember(work.id, work.mangaUrl, work.chapters.size, work.storageSizeBytes) {
         mutableStateOf(work)
     }
-    var isLoadingChapters by remember(work.id, work.mangaUrl, work.isFromLocalStorage) {
-        mutableStateOf(!work.isFromLocalStorage && work.chapters.isEmpty())
+    var isLoadingChapters by remember(work.id, targetMangaUrl) {
+        mutableStateOf(work.chapters.isEmpty() && hasValidRemoteUrl)
     }
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
@@ -160,13 +170,48 @@ fun MangaDetailsScreen(
     var showMigrationDialog by remember { mutableStateOf(false) }
     var bottomActionHint by remember { mutableStateOf<String?>(null) }
 
-    val targetMangaUrl = remember(work.mangaUrl, work.siteUrl, work.id) {
-        work.mangaUrl.ifBlank { "${work.siteUrl.trimEnd('/')}/series/${work.id}" }
+    fun mergeRemoteAndLocalChapters(
+        remoteChapters: List<MangaChapter>,
+        existingChapters: List<MangaChapter>
+    ): List<MangaChapter> {
+        if (remoteChapters.isEmpty()) return existingChapters
+        if (existingChapters.isEmpty()) return remoteChapters
+        val existingByNum = existingChapters.associateBy { it.number }
+        val mergedMap = LinkedHashMap<Int, MangaChapter>()
+        for (remoteCh in remoteChapters) {
+            val localCh = existingByNum[remoteCh.number]
+            if (localCh != null && (localCh.localPagePaths.isNotEmpty() || localCh.isDownloaded || localCh.lastReadPage >= 0)) {
+                mergedMap[remoteCh.number] = remoteCh.copy(
+                    localPagePaths = localCh.localPagePaths,
+                    downloadedPagesCount = localCh.downloadedPagesCount.coerceAtLeast(localCh.localPagePaths.size),
+                    pageCount = localCh.pageCount.coerceAtLeast(remoteCh.pageCount),
+                    isDownloaded = localCh.isDownloaded,
+                    downloadStatus = localCh.downloadStatus,
+                    downloadError = localCh.downloadError,
+                    isRead = localCh.isRead || remoteCh.isRead,
+                    lastReadPage = localCh.lastReadPage,
+                    lastReadTimeText = localCh.lastReadTimeText.ifBlank { remoteCh.lastReadTimeText },
+                    chapterKey = localCh.chapterKey.ifBlank { remoteCh.chapterKey }
+                )
+            } else {
+                mergedMap[remoteCh.number] = remoteCh
+            }
+        }
+        // Keep any purely local downloaded chapters whose chapter number wasn't in remoteChapters
+        for (localCh in existingChapters) {
+            if (!mergedMap.containsKey(localCh.number) && (localCh.localPagePaths.isNotEmpty() || localCh.isDownloaded)) {
+                mergedMap[localCh.number] = localCh
+            }
+        }
+        return mergedMap.values.sortedWith(
+            compareBy<MangaChapter> { it.chapterNumberValue }
+                .thenBy { it.number }
+        )
     }
 
-    // Fetch live details & chapters from the website URL when not purely offline
+    // Fetch live details & chapters from the website URL whenever a valid remote URL exists
     LaunchedEffect(work.id, targetMangaUrl, refreshTrigger) {
-        if (work.isFromLocalStorage && refreshTrigger == 0) {
+        if (!hasValidRemoteUrl) {
             isLoadingChapters = false
             return@LaunchedEffect
         }
@@ -175,28 +220,16 @@ fun MangaDetailsScreen(
         }
         val res = LiveMangaSiteScraper.fetchMangaDetails(liveWork.copy(mangaUrl = targetMangaUrl))
         if (res.work.chapters.isNotEmpty() || res.work.description.isNotBlank()) {
-            // Preserve local chapter paths if any were already downloaded
-            val existingLocalByNum = liveWork.chapters.associateBy { it.number }
-            val mergedChs = res.work.chapters.map { remoteCh ->
-                val localCh = existingLocalByNum[remoteCh.number]
-                if (localCh != null && localCh.localPagePaths.isNotEmpty()) {
-                    remoteCh.copy(
-                        localPagePaths = localCh.localPagePaths,
-                        downloadStatus = localCh.downloadStatus,
-                        lastReadPage = localCh.lastReadPage,
-                        lastReadTimeText = localCh.lastReadTimeText,
-                        chapterKey = localCh.chapterKey
-                    )
-                } else {
-                    remoteCh
-                }
-            }
-            liveWork = res.work.copy(
+            val mergedChs = mergeRemoteAndLocalChapters(res.work.chapters, liveWork.chapters)
+            val updated = res.work.copy(
                 localCoverPath = liveWork.localCoverPath,
                 isFromLocalStorage = liveWork.isFromLocalStorage,
                 storageSizeBytes = liveWork.storageSizeBytes,
-                chapters = if (mergedChs.isNotEmpty()) mergedChs else liveWork.chapters
+                chapters = mergedChs,
+                chaptersCount = maxOf(mergedChs.size, res.work.chaptersCount, liveWork.chaptersCount)
             )
+            liveWork = updated
+            onWorkDetailsUpdated(updated)
             isLoadingChapters = false
         } else {
             delay(1300)
@@ -204,8 +237,8 @@ fun MangaDetailsScreen(
         }
     }
 
-    // Only run HiddenSiteWebViewBridge when online or explicitly refreshing
-    if (!work.isFromLocalStorage || refreshTrigger > 0) {
+    // Run HiddenSiteWebViewBridge whenever targetMangaUrl is a valid HTTP/HTTPS URL and chapters are empty or refreshing
+    if (hasValidRemoteUrl && (liveWork.chapters.isEmpty() || !work.isFromLocalStorage || refreshTrigger > 0)) {
         HiddenSiteWebViewBridge(
             targetUrl = targetMangaUrl,
             jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_DETAILS,
@@ -213,11 +246,16 @@ fun MangaDetailsScreen(
             onResultJson = { rawJson ->
                 val domRes = LiveMangaSiteScraper.parseDetailsFromDomJson(rawJson, liveWork)
                 if (domRes.work.chapters.isNotEmpty() || domRes.work.description.isNotBlank()) {
-                    liveWork = domRes.work.copy(
+                    val mergedChs = mergeRemoteAndLocalChapters(domRes.work.chapters, liveWork.chapters)
+                    val updated = domRes.work.copy(
                         localCoverPath = liveWork.localCoverPath,
                         isFromLocalStorage = liveWork.isFromLocalStorage,
-                        storageSizeBytes = liveWork.storageSizeBytes
+                        storageSizeBytes = liveWork.storageSizeBytes,
+                        chapters = mergedChs,
+                        chaptersCount = maxOf(mergedChs.size, domRes.work.chaptersCount, liveWork.chaptersCount)
                     )
+                    liveWork = updated
+                    onWorkDetailsUpdated(updated)
                     isLoadingChapters = false
                 }
             }
@@ -822,21 +860,26 @@ fun MangaDetailsScreen(
                         }
                     }
                 } else {
-                    val chaptersToDisplay = if (liveWork.isFromLocalStorage) {
-                        displayedChapters.filter { ch ->
-                            val st = chapterDownloadStates[ch.number]?.status?.ifBlank { ch.downloadStatus } ?: ch.downloadStatus
-                            (ch.number in downloadedChapterNumbers) || (ch.isDownloaded && st == "COMPLETED")
-                        }
-                    } else {
-                        displayedChapters
+                    val savedOfflineChapters = displayedChapters.filter { ch ->
+                        val st = chapterDownloadStates[ch.number]?.status?.ifBlank { ch.downloadStatus } ?: ch.downloadStatus
+                        (ch.number in downloadedChapterNumbers) || (ch.isDownloaded && st == "COMPLETED") || (ch.localPagePaths.isNotEmpty() && st == "COMPLETED")
                     }
                     val incompleteStorageChapters = if (liveWork.isFromLocalStorage) {
                         displayedChapters.filter { ch ->
                             val st = chapterDownloadStates[ch.number]?.status?.ifBlank { ch.downloadStatus } ?: ch.downloadStatus
-                            !((ch.number in downloadedChapterNumbers) || (ch.isDownloaded && st == "COMPLETED"))
+                            val isSaved = (ch.number in downloadedChapterNumbers) || (ch.isDownloaded && st == "COMPLETED") || (ch.localPagePaths.isNotEmpty() && st == "COMPLETED")
+                            !isSaved && (st == "INCOMPLETE" || st == "FAILED" || st == "DOWNLOADING" || st == "QUEUED")
                         }
                     } else {
                         emptyList()
+                    }
+                    val hasOnlyLocalChapters = liveWork.isFromLocalStorage &&
+                        savedOfflineChapters.isNotEmpty() &&
+                        (savedOfflineChapters.size + incompleteStorageChapters.size == displayedChapters.size)
+                    val chaptersToDisplay = if (hasOnlyLocalChapters) {
+                        savedOfflineChapters
+                    } else {
+                        displayedChapters
                     }
 
                     LazyColumn(
@@ -845,10 +888,10 @@ fun MangaDetailsScreen(
                             .testTag("chapters_lazy_column"),
                         contentPadding = PaddingValues(vertical = 6.dp)
                     ) {
-                        if (liveWork.isFromLocalStorage && chaptersToDisplay.isNotEmpty()) {
+                        if (liveWork.isFromLocalStorage && savedOfflineChapters.isNotEmpty()) {
                             item(key = "completed_offline_header") {
                                 Text(
-                                    text = "الفصول المكتملة (جاهزة بدون إنترنت: ${chaptersToDisplay.size})",
+                                    text = "الفصول المكتملة (جاهزة بدون إنترنت: ${savedOfflineChapters.size} من ${displayedChapters.size})",
                                     color = Color(0xFF81C784),
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,

@@ -806,22 +806,24 @@ object LiveMangaSiteScraper {
             val request = buildRequest(targetUrl, referer = work.siteUrl)
             var parsedWork = work
             var hitCloudflare = false
+            var initialHtml = ""
 
             try {
                 httpClient.newCall(request).execute().use { response ->
                     val html = response.body?.string() ?: ""
+                    initialHtml = html
                     if (isCloudflareChallengeHtml(html, response.code)) {
                         hitCloudflare = true
                     } else if (html.isNotBlank()) {
                         parsedWork = parseMangaDetailsHtml(html, work, targetUrl)
 
-                        // Madara WordPress AJAX chapters fallback if chapters weren't in initial HTML
+                        // Fallback 1: Madara WordPress /ajax/chapters/ endpoint (POST & GET)
                         if (parsedWork.chapters.isEmpty()) {
-                            val ajaxUrl = targetUrl.trimEnd('/') + "/ajax/chapters/"
+                            val ajaxUrl = targetUrl.substringBefore("?").substringBefore("#").trimEnd('/') + "/ajax/chapters/"
                             try {
                                 httpClient.newCall(buildRequest(ajaxUrl, referer = targetUrl, postFormBody = "")).execute().use { ajaxResp ->
                                     val ajaxHtml = ajaxResp.body?.string() ?: ""
-                                    val ajaxChapters = parseChaptersFromHtmlFragment(ajaxHtml, work.id, targetUrl)
+                                    val ajaxChapters = parseChaptersFromHtmlFragment(ajaxHtml, work.id, targetUrl, isInsideChapterContainer = true)
                                     if (ajaxChapters.isNotEmpty()) {
                                         parsedWork = parsedWork.copy(
                                             chapters = ajaxChapters,
@@ -831,6 +833,53 @@ object LiveMangaSiteScraper {
                                     }
                                 }
                             } catch (_: Exception) {
+                            }
+                            if (parsedWork.chapters.isEmpty()) {
+                                try {
+                                    httpClient.newCall(buildRequest(ajaxUrl, referer = targetUrl)).execute().use { ajaxGetResp ->
+                                        val ajaxHtml = ajaxGetResp.body?.string() ?: ""
+                                        val ajaxChapters = parseChaptersFromHtmlFragment(ajaxHtml, work.id, targetUrl, isInsideChapterContainer = true)
+                                        if (ajaxChapters.isNotEmpty()) {
+                                            parsedWork = parsedWork.copy(
+                                                chapters = ajaxChapters,
+                                                chaptersCount = ajaxChapters.size,
+                                                isDetailsLoaded = true
+                                            )
+                                        }
+                                    }
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }
+
+                        // Fallback 2: Madara classic wp-admin/admin-ajax.php (action=manga_get_chapters&manga=postId)
+                        if (parsedWork.chapters.isEmpty()) {
+                            val postId = extractWordPressMangaPostId(html)
+                            if (postId.isNotBlank()) {
+                                val origin = extractOriginUrl(targetUrl).ifBlank { work.siteUrl.trimEnd('/') }
+                                if (origin.isNotBlank()) {
+                                    val adminAjaxUrl = "$origin/wp-admin/admin-ajax.php"
+                                    try {
+                                        httpClient.newCall(
+                                            buildRequest(
+                                                url = adminAjaxUrl,
+                                                referer = targetUrl,
+                                                postFormBody = "action=manga_get_chapters&manga=$postId"
+                                            )
+                                        ).execute().use { adminResp ->
+                                            val adminHtml = adminResp.body?.string() ?: ""
+                                            val adminChapters = parseChaptersFromHtmlFragment(adminHtml, work.id, targetUrl, isInsideChapterContainer = true)
+                                            if (adminChapters.isNotEmpty()) {
+                                                parsedWork = parsedWork.copy(
+                                                    chapters = adminChapters,
+                                                    chaptersCount = adminChapters.size,
+                                                    isDetailsLoaded = true
+                                                )
+                                            }
+                                        }
+                                    } catch (_: Exception) {
+                                    }
+                                }
                             }
                         }
 
@@ -858,12 +907,14 @@ object LiveMangaSiteScraper {
                                 } catch (_: Exception) {
                                 }
                             }
-                            val finalChapters = deduplicateAndSortChapters(mergedByUrl.values.toList(), work.id)
-                            parsedWork = parsedWork.copy(
-                                chapters = finalChapters,
-                                chaptersCount = finalChapters.size,
-                                isDetailsLoaded = true
-                            )
+                            if (mergedByUrl.isNotEmpty()) {
+                                val finalChapters = deduplicateAndSortChapters(mergedByUrl.values.toList(), work.id)
+                                parsedWork = parsedWork.copy(
+                                    chapters = finalChapters,
+                                    chaptersCount = finalChapters.size,
+                                    isDetailsLoaded = true
+                                )
+                            }
                         }
                     }
                 }
@@ -872,7 +923,7 @@ object LiveMangaSiteScraper {
 
             // Headless WebView fallback if chapters are still empty or hit Cloudflare
             if (parsedWork.chapters.isEmpty()) {
-                val domJson = evaluateJsInHeadlessWebView(targetUrl, JS_EXTRACT_DETAILS)
+                val domJson = evaluateJsInHeadlessWebView(targetUrl, JS_EXTRACT_DETAILS, timeoutMs = 15_000L)
                 if (!domJson.isNullOrBlank()) {
                     val domRes = parseDetailsFromDomJson(domJson, parsedWork)
                     if (domRes.work.chapters.isNotEmpty() || domRes.work.description.isNotBlank()) {
@@ -880,6 +931,26 @@ object LiveMangaSiteScraper {
                         hitCloudflare = false
                     }
                 }
+            }
+
+            // If still empty or only summary endpoints were found, check if we can infer chapters from initial HTML metadata/endpoints
+            if (parsedWork.chapters.isEmpty() && initialHtml.isNotBlank()) {
+                val inferred = inferChaptersFromPageMetadataOrEndpoints(initialHtml, parsedWork.id, targetUrl)
+                if (inferred.isNotEmpty()) {
+                    parsedWork = parsedWork.copy(
+                        chapters = inferred,
+                        chaptersCount = inferred.size,
+                        isDetailsLoaded = true
+                    )
+                }
+            }
+
+            // Preserve any existing chapters on `work` if network/scraping returned 0 chapters
+            if (parsedWork.chapters.isEmpty() && work.chapters.isNotEmpty()) {
+                parsedWork = parsedWork.copy(
+                    chapters = work.chapters,
+                    chaptersCount = maxOf(work.chapters.size, parsedWork.chaptersCount)
+                )
             }
 
             if (parsedWork.genres.isEmpty()) {
@@ -894,6 +965,37 @@ object LiveMangaSiteScraper {
                 errorMessage = e.localizedMessage ?: "تعذر جلب تفاصيل المانجا"
             )
         }
+    }
+
+    private fun extractOriginUrl(url: String): String {
+        return try {
+            val uri = URI(url.trim())
+            val scheme = uri.scheme ?: "https"
+            val host = uri.host ?: return ""
+            val portPart = if (uri.port > 0 && uri.port != 80 && uri.port != 443) ":${uri.port}" else ""
+            "$scheme://$host$portPart"
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun extractWordPressMangaPostId(html: String): String {
+        val patterns = listOf(
+            Regex("""id=["']manga-chapters-holder["'][^>]*data-id=["'](\d+)["']""", RegexOption.IGNORE_CASE),
+            Regex("""data-id=["'](\d+)["'][^>]*id=["']manga-chapters-holder["']""", RegexOption.IGNORE_CASE),
+            Regex(""""manga_id"\s*:\s*["']?(\d+)["']?""", RegexOption.IGNORE_CASE),
+            Regex("""manga_id\s*=\s*["']?(\d+)["']?""", RegexOption.IGNORE_CASE),
+            Regex("""class=["'][^"']*rating-post-id["'][^>]*value=["'](\d+)["']""", RegexOption.IGNORE_CASE),
+            Regex("""value=["'](\d+)["'][^>]*class=["'][^"']*rating-post-id["']""", RegexOption.IGNORE_CASE),
+            Regex("""data-post-id=["'](\d+)["']""", RegexOption.IGNORE_CASE),
+            Regex("""data-manga-id=["'](\d+)["']""", RegexOption.IGNORE_CASE),
+            Regex("""\bpostid-(\d+)\b""", RegexOption.IGNORE_CASE)
+        )
+        for (regex in patterns) {
+            val id = regex.find(html)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+            if (id.isNotBlank() && id != "0") return id
+        }
+        return ""
     }
 
     fun parseMangaDetailsHtml(html: String, baseWork: MangaWork, pageUrl: String): MangaWork {
@@ -996,30 +1098,60 @@ object LiveMangaSiteScraper {
      * 3. عنوان الفصل النظيف بدون إقحام التاريخ داخله
      * كما يمنع تحويل العناوين المشوهة بالتاريخ مثل 201/10/2026 إلى الفصل 201.
      */
-    fun parseChaptersFromHtmlFragment(html: String, workId: String, pageUrl: String): List<MangaChapter> {
+    fun parseChaptersFromHtmlFragment(
+        html: String,
+        workId: String,
+        pageUrl: String,
+        isInsideChapterContainer: Boolean = false
+    ): List<MangaChapter> {
         if (html.isBlank()) return emptyList()
         val rawChapters = mutableListOf<MangaChapter>()
+        val summaryButtonChapters = mutableListOf<MangaChapter>()
         val seenUrlKeys = HashSet<String>()
 
+        // Strategy 0: Extract chapters from <select><option> dropdowns or embedded JSON in <script> before stripping scripts
         val cleanHtml = html
             .replace(Regex("<script[^>]*>[\\s\\S]*?</script>", RegexOption.IGNORE_CASE), "")
             .replace(Regex("<style[^>]*>[\\s\\S]*?</style>", RegexOption.IGNORE_CASE), "")
+            // Remove related/recommended manga sections at the bottom/sidebar so their links don't pollute the work's chapters
+            .replace(
+                Regex("""<(?:div|section|aside)[^>]+class=["'][^"']*(?:related-manga|related-series|c-blog__heading|widget-manga-recent|popular-slider|hot-series)[^"']*["'][^>]*>[\s\S]{10,15000}?</(?:div|section|aside)>""", RegexOption.IGNORE_CASE),
+                ""
+            )
 
-        // Strategy 1: Structured chapter items (<li>, <tr>, <div class="chbox/eph-num/chapter-item">)
-        val structuredItemRegex = Regex(
-            """<(?:li|tr|div)[^>]*(?:class=["'][^"']*(?:wp-manga-chapter|ch-main-anchor|eph-num|chapter-li|chbox|chapter-item|a-h)[^"']*["']|data-num=["'][^"']+["'])[^>]*>([\s\S]{10,2000}?)</(?:li|tr|div)>""",
+        // Strategy 1A: Structured <li> and <tr> chapter rows (safe from nested <div> truncation!)
+        val liTrRegex = Regex(
+            """<(li|tr)\b([^>]*)>([\s\S]{5,3000}?)</\1>""",
             RegexOption.IGNORE_CASE
         )
+        liTrRegex.findAll(cleanHtml).forEach { match ->
+            val attrs = match.groupValues[2]
+            val innerBlock = match.groupValues[3]
+            val hasExplicitChapterMarker = isInsideChapterContainer ||
+                attrs.contains("wp-manga-chapter", ignoreCase = true) ||
+                attrs.contains("chapter", ignoreCase = true) ||
+                attrs.contains("ch-main-anchor", ignoreCase = true) ||
+                attrs.contains("eph-num", ignoreCase = true) ||
+                attrs.contains("chbox", ignoreCase = true) ||
+                attrs.contains("a-h", ignoreCase = true) ||
+                attrs.contains("data-num", ignoreCase = true) ||
+                attrs.contains("data-chapter", ignoreCase = true) ||
+                innerBlock.contains("eph-num", ignoreCase = true) ||
+                innerBlock.contains("chbox", ignoreCase = true) ||
+                innerBlock.contains("chapternum", ignoreCase = true) ||
+                innerBlock.contains("chapterdate", ignoreCase = true) ||
+                innerBlock.contains("chapter-release-date", ignoreCase = true) ||
+                innerBlock.contains("chapter-title", ignoreCase = true) ||
+                innerBlock.contains("ch-num", ignoreCase = true) ||
+                innerBlock.contains("epxs", ignoreCase = true)
 
-        structuredItemRegex.findAll(cleanHtml).forEach { match ->
-            val fullTag = match.value
-            val innerBlock = match.groupValues[1]
             val parsed = parseSingleChapterBlock(
-                fullBlockHtml = fullTag,
+                fullBlockHtml = match.value,
                 innerBlockHtml = innerBlock,
                 workId = workId,
                 pageUrl = pageUrl,
-                fallbackOrder = rawChapters.size + 1
+                fallbackOrder = rawChapters.size + 1,
+                trustContainerContext = hasExplicitChapterMarker
             )
             if (parsed != null) {
                 val urlKey = normalizeChapterUrlKey(parsed.chapterUrl)
@@ -1029,80 +1161,245 @@ object LiveMangaSiteScraper {
             }
         }
 
-        // Strategy 2: Scan inside explicit chapter list containers (.eplister, #chapterlist, .clstyle, .listing-chapters_wrap, .chapters-list)
-        val containerRegex = Regex(
-            """<(?:div|ul|section)[^>]+(?:id|class)=["'][^"']*(?:eplister|chapterlist|clstyle|listing-chapters_wrap|chapters-list|version-chap|page-content-listing|series-chapters)[^"']*["'][^>]*>([\s\S]{20,180000}?)</(?:div|ul|section)>""",
+        // Strategy 1B: Structured <div> chapter items (including nested div structures like <div class="chbox"><div class="eph-num"><a...>)
+        val divMarkerRegex = Regex(
+            """<div\b[^>]*(?:class=["'][^"']*(?:wp-manga-chapter|ch-main-anchor|eph-num|chapter-li|chbox|chapter-item|a-h|ts-chl-collapsible)[^"']*["']|data-num=["'][^"']+["']|data-chapter=["'][^"']+["'])[^>]*>""",
             RegexOption.IGNORE_CASE
         )
-        val containerMatches = containerRegex.findAll(cleanHtml).toList()
-        val anchorScopeHtml = if (containerMatches.isNotEmpty()) {
-            containerMatches.joinToString("\n") { it.groupValues[1] }
-        } else {
-            cleanHtml
-        }
-
-        // Scan <li> blocks inside chapter containers even if they don't have a specific class
-        if (containerMatches.isNotEmpty()) {
-            Regex("""<li[^>]*>([\s\S]{10,1500}?)</li>""", RegexOption.IGNORE_CASE)
-                .findAll(anchorScopeHtml)
-                .forEach { liMatch ->
-                    val parsed = parseSingleChapterBlock(
-                        fullBlockHtml = liMatch.value,
-                        innerBlockHtml = liMatch.groupValues[1],
-                        workId = workId,
-                        pageUrl = pageUrl,
-                        fallbackOrder = rawChapters.size + 1
-                    )
-                    if (parsed != null) {
-                        val urlKey = normalizeChapterUrlKey(parsed.chapterUrl)
-                        if (urlKey.isNotBlank() && seenUrlKeys.add(urlKey)) {
-                            rawChapters.add(parsed)
-                        }
+        divMarkerRegex.findAll(cleanHtml).forEach { markerMatch ->
+            val startIdx = markerMatch.range.first
+            val windowEnd = (startIdx + 1800).coerceAtMost(cleanHtml.length)
+            val windowHtml = cleanHtml.substring(startIdx, windowEnd)
+            // Take up to the end of the first </a> plus any trailing date span (up to 400 chars after </a>)
+            val firstCloseA = windowHtml.indexOf("</a>", ignoreCase = true)
+            if (firstCloseA != -1) {
+                val blockEnd = (firstCloseA + 400).coerceAtMost(windowHtml.length)
+                val candidateBlock = windowHtml.substring(0, blockEnd)
+                val parsed = parseSingleChapterBlock(
+                    fullBlockHtml = candidateBlock,
+                    innerBlockHtml = candidateBlock,
+                    workId = workId,
+                    pageUrl = pageUrl,
+                    fallbackOrder = rawChapters.size + 1,
+                    trustContainerContext = true
+                )
+                if (parsed != null) {
+                    val urlKey = normalizeChapterUrlKey(parsed.chapterUrl)
+                    if (urlKey.isNotBlank() && seenUrlKeys.add(urlKey)) {
+                        rawChapters.add(parsed)
                     }
                 }
+            }
         }
 
-        // Strategy 3: Scan chapter anchors if not already captured
-        // Note: If structured items were already found, only accept anchors that belong to the same work path
-        // and aren't "First/Last chapter" summary buttons (which have classes like 'first-chapter', 'last-chapter', 'btn').
-        val anchorRegex = Regex("""<a([^>]+href=["']([^"']+)["'][^>]*)>([\s\S]{1,800}?)</a>""", RegexOption.IGNORE_CASE)
-        anchorRegex.findAll(anchorScopeHtml).forEach { match ->
+        // Strategy 2: Universal Anchor Scan across the ENTIRE cleanHtml (never truncated by container </div>!)
+        val anchorRegex = Regex("""<a(\b[^>]*href=["']([^"']+)["'][^>]*)>([\s\S]{1,1500}?)</a>""", RegexOption.IGNORE_CASE)
+        anchorRegex.findAll(cleanHtml).forEach { match ->
             val aAttrs = match.groupValues[1]
-            val rawHref = match.groupValues[2]
+            val rawHref = match.groupValues[2].trim()
             val innerHtml = match.groupValues[3]
-            if (aAttrs.contains("btn", ignoreCase = true) ||
-                aAttrs.contains("first-chapter", ignoreCase = true) ||
-                aAttrs.contains("last-chapter", ignoreCase = true) ||
-                aAttrs.contains("bookmark", ignoreCase = true)
-            ) {
+            if (rawHref.isBlank() || rawHref.startsWith("#") || rawHref.startsWith("javascript:", ignoreCase = true)) {
                 return@forEach
             }
+            if (aAttrs.contains("bookmark", ignoreCase = true)) {
+                return@forEach
+            }
+
             val chUrl = resolveUrl(pageUrl, rawHref)
             val urlKey = normalizeChapterUrlKey(chUrl)
             if (chUrl.isBlank() || urlKey.isBlank() || seenUrlKeys.contains(urlKey)) return@forEach
 
-            val looksLikeChapterUrl = isLikelyChapterUrl(chUrl, pageUrl)
-            val strippedCheck = stripHtmlTags(innerHtml)
-            val looksLikeChapterText = strippedCheck.contains("فصل") ||
-                strippedCheck.contains("الفصل") ||
-                strippedCheck.contains("Chapter", ignoreCase = true) ||
-                strippedCheck.contains("Ch.", ignoreCase = true)
+            val strippedText = stripHtmlTags(innerHtml).trim()
+            val isSummaryBtn = aAttrs.contains("first-chapter", ignoreCase = true) ||
+                aAttrs.contains("last-chapter", ignoreCase = true) ||
+                strippedText.equals("أول فصل", ignoreCase = true) ||
+                strippedText.equals("الفصل الأول", ignoreCase = true) ||
+                strippedText.equals("آخر فصل", ignoreCase = true) ||
+                strippedText.equals("الفصل الأخير", ignoreCase = true) ||
+                strippedText.equals("ابدأ القراءة", ignoreCase = true) ||
+                strippedText.equals("إبدأ القراءة", ignoreCase = true) ||
+                strippedText.equals("First Chapter", ignoreCase = true) ||
+                strippedText.equals("Last Chapter", ignoreCase = true) ||
+                strippedText.equals("Read First", ignoreCase = true) ||
+                strippedText.equals("Read Last", ignoreCase = true)
 
-            if (looksLikeChapterUrl || (looksLikeChapterText && isSameWorkContext(chUrl, pageUrl))) {
+            val looksLikeChapterUrl = isLikelyChapterUrl(chUrl, pageUrl)
+            val hasChapterChildClasses = innerHtml.contains("chapternum", ignoreCase = true) ||
+                innerHtml.contains("chapter-title", ignoreCase = true) ||
+                innerHtml.contains("chapter-number", ignoreCase = true) ||
+                innerHtml.contains("ch-num", ignoreCase = true) ||
+                innerHtml.contains("eph-num", ignoreCase = true) ||
+                innerHtml.contains("chbox", ignoreCase = true) ||
+                innerHtml.contains("epxs", ignoreCase = true)
+            val looksLikeChapterText = strippedText.contains("فصل") ||
+                strippedText.contains("الفصل") ||
+                strippedText.contains("Chapter", ignoreCase = true) ||
+                strippedText.contains("Ch.", ignoreCase = true) ||
+                Regex("""^(?:ch|ep|#)?\s*\d+(?:\.\d+)?$""", RegexOption.IGNORE_CASE).matches(strippedText)
+
+            if (looksLikeChapterUrl || hasChapterChildClasses || (looksLikeChapterText && (isInsideChapterContainer || isSameWorkContext(chUrl, pageUrl)))) {
+                // Include surrounding context (up to 250 chars before and after <a>) to capture sibling date or data-num attributes
+                val contextStart = (match.range.first - 250).coerceAtLeast(0)
+                val contextEnd = (match.range.last + 250).coerceAtMost(cleanHtml.length)
+                val surroundingHtml = cleanHtml.substring(contextStart, contextEnd)
+
                 val parsed = parseSingleChapterBlock(
-                    fullBlockHtml = match.value,
+                    fullBlockHtml = surroundingHtml,
                     innerBlockHtml = match.value,
                     workId = workId,
                     pageUrl = pageUrl,
-                    fallbackOrder = rawChapters.size + 1
+                    fallbackOrder = (rawChapters.size + summaryButtonChapters.size) + 1,
+                    trustContainerContext = isInsideChapterContainer || hasChapterChildClasses || looksLikeChapterUrl
                 )
-                if (parsed != null && seenUrlKeys.add(urlKey)) {
-                    rawChapters.add(parsed)
+                if (parsed != null) {
+                    if (isSummaryBtn) {
+                        summaryButtonChapters.add(
+                            parsed.copy(title = "الفصل ${parsed.displayNumber}")
+                        )
+                    } else if (seenUrlKeys.add(urlKey)) {
+                        rawChapters.add(parsed)
+                    }
                 }
             }
         }
 
+        // Strategy 3: <select><option value="..."> chapter selector fallback
+        if (rawChapters.isEmpty()) {
+            val optionRegex = Regex("""<option[^>]+value=["']([^"']+)["'][^>]*>([\s\S]{1,200}?)</option>""", RegexOption.IGNORE_CASE)
+            optionRegex.findAll(cleanHtml).forEach { optMatch ->
+                val rawVal = optMatch.groupValues[1].trim()
+                val optText = stripHtmlTags(optMatch.groupValues[2]).trim()
+                val chUrl = resolveUrl(pageUrl, rawVal)
+                val urlKey = normalizeChapterUrlKey(chUrl)
+                if (chUrl.startsWith("http") && urlKey.isNotBlank() && !seenUrlKeys.contains(urlKey)) {
+                    if (isLikelyChapterUrl(chUrl, pageUrl) || optText.contains("فصل") || optText.contains("Chapter", ignoreCase = true)) {
+                        val separated = separateTitleAndEmbeddedDate(optText, "", chUrl, pageUrl)
+                        val numInfo = parseChapterNumberInfo(separated.cleanTitle, optText, chUrl, pageUrl, fallback = rawChapters.size + 1)
+                        if (seenUrlKeys.add(urlKey)) {
+                            rawChapters.add(
+                                MangaChapter(
+                                    id = "${workId}_ch_${numInfo.label.replace('.', '_')}_${rawChapters.size + 1}",
+                                    number = numInfo.intNumber,
+                                    title = separated.cleanTitle.ifBlank { "الفصل ${numInfo.label}" },
+                                    dateText = separated.dateText,
+                                    chapterUrl = chUrl,
+                                    chapterNumberValue = numInfo.doubleValue,
+                                    numberLabel = numInfo.label
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strategy 4: Embedded JSON / Next.js / Nuxt / JS chapter objects in raw HTML (before script removal)
+        if (rawChapters.isEmpty()) {
+            val jsonChapters = extractChaptersFromEmbeddedScripts(html, workId, pageUrl)
+            for (ch in jsonChapters) {
+                val urlKey = normalizeChapterUrlKey(ch.chapterUrl)
+                if (urlKey.isNotBlank() && seenUrlKeys.add(urlKey)) {
+                    rawChapters.add(ch)
+                }
+            }
+        }
+
+        // If only summary buttons ("أول فصل" / "آخر فصل") were found, include them and expand numeric range if applicable
+        if (rawChapters.isEmpty() && summaryButtonChapters.isNotEmpty()) {
+            summaryButtonChapters.forEach { ch ->
+                val urlKey = normalizeChapterUrlKey(ch.chapterUrl)
+                if (urlKey.isNotBlank() && seenUrlKeys.add(urlKey)) {
+                    rawChapters.add(ch)
+                }
+            }
+            val expanded = expandChapterRangeFromEndpointsIfNumeric(rawChapters, workId, pageUrl)
+            if (expanded.size > rawChapters.size) {
+                return deduplicateAndSortChapters(expanded, workId)
+            }
+        }
+
         return deduplicateAndSortChapters(rawChapters, workId)
+    }
+
+    private fun extractChaptersFromEmbeddedScripts(html: String, workId: String, pageUrl: String): List<MangaChapter> {
+        val results = mutableListOf<MangaChapter>()
+        // Match JSON objects or escaped URLs pointing to chapters of the current work
+        val baseClean = pageUrl.substringBefore("?").substringBefore("#").trimEnd('/')
+        if (baseClean.isBlank()) return emptyList()
+        val escapedBase = Regex.escape(baseClean).replace("/", "\\\\?/")
+        val urlInScriptRegex = Regex("""($escapedBase/(?:chapter[-_]?)?\d+(?:[._-]\d+)?/?)""", RegexOption.IGNORE_CASE)
+        val seen = HashSet<String>()
+        urlInScriptRegex.findAll(html).forEach { m ->
+            val rawUrl = m.groupValues[1].replace("\\/", "/")
+            val chUrl = resolveUrl(pageUrl, rawUrl)
+            val key = normalizeChapterUrlKey(chUrl)
+            if (key.isNotBlank() && seen.add(key) && isLikelyChapterUrl(chUrl, pageUrl)) {
+                val numInfo = parseChapterNumberInfo("", "", chUrl, pageUrl, fallback = results.size + 1)
+                results.add(
+                    MangaChapter(
+                        id = "${workId}_ch_${numInfo.label.replace('.', '_')}_${results.size + 1}",
+                        number = numInfo.intNumber,
+                        title = "الفصل ${numInfo.label}",
+                        dateText = "",
+                        chapterUrl = chUrl,
+                        chapterNumberValue = numInfo.doubleValue,
+                        numberLabel = numInfo.label
+                    )
+                )
+            }
+        }
+        return results
+    }
+
+    private fun expandChapterRangeFromEndpointsIfNumeric(
+        endpoints: List<MangaChapter>,
+        workId: String,
+        pageUrl: String
+    ): List<MangaChapter> {
+        val maxCh = endpoints.maxByOrNull { it.number } ?: return endpoints
+        if (maxCh.number !in 2..500) return endpoints
+        val cleanMaxUrl = maxCh.chapterUrl.substringBefore("?").substringBefore("#").trimEnd('/')
+        val maxStr = maxCh.number.toString()
+        if (!cleanMaxUrl.endsWith("/$maxStr") && !cleanMaxUrl.endsWith("-$maxStr")) return endpoints
+        val prefix = cleanMaxUrl.substring(0, cleanMaxUrl.length - maxStr.length)
+        val byNum = endpoints.associateBy { it.number }
+        return (1..maxCh.number).map { n ->
+            byNum[n] ?: MangaChapter(
+                id = "${workId}_ch_$n",
+                number = n,
+                title = "الفصل $n",
+                dateText = "",
+                chapterUrl = "$prefix$n",
+                chapterNumberValue = n.toDouble(),
+                numberLabel = n.toString()
+            )
+        }
+    }
+
+    private fun inferChaptersFromPageMetadataOrEndpoints(
+        html: String,
+        workId: String,
+        pageUrl: String
+    ): List<MangaChapter> {
+        // Look for explicit chapter count in Arabic/English metadata on the page if URL follows standard /series/slug or /manga/slug
+        val countMatch = Regex("""(?:عدد الفصول|الفصول|Chapters)\s*[:：]?\s*(\d{1,3})\b""", RegexOption.IGNORE_CASE)
+            .find(stripHtmlTags(html))
+            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+        if (countMatch != null && countMatch in 1..400) {
+            val baseClean = pageUrl.substringBefore("?").substringBefore("#").trimEnd('/')
+            return (1..countMatch).map { n ->
+                MangaChapter(
+                    id = "${workId}_ch_$n",
+                    number = n,
+                    title = "الفصل $n",
+                    dateText = "",
+                    chapterUrl = "$baseClean/$n",
+                    chapterNumberValue = n.toDouble(),
+                    numberLabel = n.toString()
+                )
+            }
+        }
+        return emptyList()
     }
 
     private fun parseSingleChapterBlock(
@@ -1110,23 +1407,42 @@ object LiveMangaSiteScraper {
         innerBlockHtml: String,
         workId: String,
         pageUrl: String,
-        fallbackOrder: Int
+        fallbackOrder: Int,
+        trustContainerContext: Boolean = false
     ): MangaChapter? {
-        val aMatch = Regex("""<a([^>]+href=["']([^"']+)["'][^>]*)>([\s\S]*?)</a>""", RegexOption.IGNORE_CASE)
-            .find(innerBlockHtml) ?: return null
+        // Find all <a> tags inside innerBlockHtml and pick the best chapter link (some blocks have a secondary download/icon <a> first)
+        val allAnchors = Regex("""<a(\b[^>]*href=["']([^"']+)["'][^>]*)>([\s\S]*?)</a>""", RegexOption.IGNORE_CASE)
+            .findAll(innerBlockHtml)
+            .toList()
+        if (allAnchors.isEmpty()) return null
+
+        val aMatch = allAnchors.firstOrNull { m ->
+            val u = resolveUrl(pageUrl, m.groupValues[2].trim())
+            val txt = stripHtmlTags(m.groupValues[3]).trim()
+            u.isNotBlank() && !u.startsWith("javascript:", ignoreCase = true) &&
+                (isLikelyChapterUrl(u, pageUrl) || txt.contains("فصل") || txt.contains("Chapter", ignoreCase = true) || m.groupValues[3].contains("chapternum", ignoreCase = true))
+        } ?: allAnchors.first()
+
         val aAttrs = aMatch.groupValues[1]
-        val chUrl = resolveUrl(pageUrl, aMatch.groupValues[2])
-        if (chUrl.isBlank() || !isLikelyChapterUrl(chUrl, pageUrl)) return null
+        val rawHref = aMatch.groupValues[2].trim()
+        if (rawHref.isBlank() || rawHref.startsWith("#") || rawHref.startsWith("javascript:", ignoreCase = true)) return null
+        val chUrl = resolveUrl(pageUrl, rawHref)
+        if (chUrl.isBlank()) return null
+
+        // Reject if it points to the manga page itself or an obvious non-chapter page
+        if (isRejectedNonChapterUrl(chUrl, pageUrl)) return null
+        if (!trustContainerContext && !isLikelyChapterUrl(chUrl, pageUrl)) return null
 
         // 1. Extract structural data-num / data-chapter if present on <li>, <div>, or <a>
         val structuralNumAttr = extractAttribute(fullBlockHtml, "data-num")
             .ifBlank { extractAttribute(fullBlockHtml, "data-chapter") }
             .ifBlank { extractAttribute(aAttrs, "data-num") }
+            .ifBlank { extractAttribute(aAttrs, "data-chapter") }
             .trim()
 
         // 2. Extract release date from explicit date elements BEFORE stripping HTML tags for the title
         val dateElementRegex = Regex(
-            """<(?:span|i|time|div|td)[^>]+class=["'][^"']*(?:chapter-release-date|chapterdate|date|post-on|time|released|ch-date)[^"']*["'][^>]*>([\s\S]*?)</(?:span|i|time|div|td)>|<time[^>]*>([\s\S]*?)</time>""",
+            """<(?:span|i|time|div|td|p)[^>]+class=["'][^"']*(?:chapter-release-date|chapterdate|date|post-on|time|released|ch-date)[^"']*["'][^>]*>([\s\S]*?)</(?:span|i|time|div|td|p)>|<time[^>]*>([\s\S]*?)</time>""",
             RegexOption.IGNORE_CASE
         )
         var extractedDate = ""
@@ -1145,15 +1461,19 @@ object LiveMangaSiteScraper {
                 " "
             )
 
-        // Prefer dedicated chapter title span (.chapternum, .chapter-title, .name, .epxs) if present
+        // Prefer dedicated chapter title span (.chapternum, .chapter-title, .name, .epxs) if present in anchor or fullBlockHtml
         val dedicatedTitleRegex = Regex(
-            """<(?:span|div|p)[^>]+class=["'][^"']*(?:chapternum|chapter-title|chapter-number|ch-num|epxs|name)[^"']*["'][^>]*>([\s\S]*?)</(?:span|div|p)>""",
+            """<(?:span|div|p|strong|b)[^>]+class=["'][^"']*(?:chapternum|chapter-title|chapter-number|ch-num|epxs|name)[^"']*["'][^>]*>([\s\S]*?)</(?:span|div|p|strong|b)>""",
             RegexOption.IGNORE_CASE
         )
         val rawTitleCandidate = dedicatedTitleRegex.find(cleanedAnchorInner)?.groupValues?.getOrNull(1)
             ?.let { stripHtmlTags(it).trim() }
             ?.takeIf { it.isNotBlank() }
+            ?: dedicatedTitleRegex.find(fullBlockHtml)?.groupValues?.getOrNull(1)
+                ?.let { stripHtmlTags(it).trim() }
+                ?.takeIf { it.isNotBlank() }
             ?: stripHtmlTags(cleanedAnchorInner).trim()
+            .ifBlank { extractAttribute(aAttrs, "title").trim() }
 
         // 4. Separate any remaining embedded dates (e.g. "03/10/2026" or "201/10/2026") from the title text
         val separated = separateTitleAndEmbeddedDate(
@@ -1364,8 +1684,10 @@ object LiveMangaSiteScraper {
 
     private fun extractChapterNumberTokenFromUrl(chapterUrl: String, mangaPageUrl: String): String {
         if (chapterUrl.isBlank()) return ""
-        val cleanUrl = chapterUrl.substringBefore("?").substringBefore("#").trimEnd('/')
-        val baseManga = mangaPageUrl.substringBefore("?").substringBefore("#").trimEnd('/')
+        val decodedChUrl = decodeUrlSafe(chapterUrl)
+        val decodedMangaUrl = decodeUrlSafe(mangaPageUrl)
+        val cleanUrl = decodedChUrl.substringBefore("?").substringBefore("#").trimEnd('/')
+        val baseManga = decodedMangaUrl.substringBefore("?").substringBefore("#").trimEnd('/')
 
         val relativePart = if (baseManga.isNotBlank() && cleanUrl.startsWith(baseManga, ignoreCase = true)) {
             cleanUrl.substring(baseManga.length).trim('/')
@@ -1373,7 +1695,7 @@ object LiveMangaSiteScraper {
             cleanUrl.substringAfterLast('/')
         }
 
-        // Match patterns like "chapter-20-1", "chapter-20.5", "20-1", "20.1", "20"
+        // Match patterns like "chapter-20-1", "chapter-20.5", "الفصل-20", "20-1", "20.1", "20"
         val urlExplicitRegex = Regex(
             """(?:chapter|ch|فصل|الفصل)[-_/\s]*(\d+(?:[._-]\d+)?)|^(\d+(?:[._-]\d+)?)$""",
             RegexOption.IGNORE_CASE
@@ -2630,6 +2952,12 @@ object LiveMangaSiteScraper {
             var title = document.title || "";
             var isCf = title.indexOf("Just a moment") !== -1 ||
                        !!document.querySelector("#cf-wrapper, .cf-browser-verification, iframe[src*='challenges.cloudflare.com']");
+            try {
+                var moreBtns = document.querySelectorAll(".chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters");
+                for (var m = 0; m < moreBtns.length; m++) {
+                    if (moreBtns[m] && typeof moreBtns[m].click === "function") moreBtns[m].click();
+                }
+            } catch (e) {}
             var h1 = document.querySelector(".post-title h1, h1.entry-title, .series-title h1, .manga-title h1, .post-title h2, main h1, article h1") || document.querySelector("h1");
             var workTitle = h1 ? h1.innerText.trim() : title;
             var coverEl = document.querySelector(".summary_image img, .thumb img, .white-bg img, .series-thumb img, .poster img, meta[property='og:image']");
@@ -2650,31 +2978,62 @@ object LiveMangaSiteScraper {
             var chapters = [];
             var seenCh = {};
             var chSelectors = [
-                ".wp-manga-chapter a", ".eplister ul li a", "#chapterlist li a",
-                ".clstyle li a", ".chapters-list a", ".ch-main-anchor a"
+                ".wp-manga-chapter a", ".eplister ul li a", ".eplister a",
+                "#chapterlist li a", "#chapterlist a", ".clstyle li a", ".clstyle a",
+                ".chapters-list a", ".chapter-list a", ".ch-main-anchor a",
+                ".eph-num a", ".chbox a", ".chapter-item a", ".chapter-li a",
+                ".listing-chapters_wrap a", ".version-chap a", ".page-content-listing a",
+                ".series-chapters a", ".ts-chl-collapsible-content a",
+                "li[data-num] a", "div[data-num] a", "tr[data-num] a"
             ];
             var chNodes = document.querySelectorAll(chSelectors.join(","));
+            var baseHref = (window.location.href || "").split("?")[0].split("#")[0].replace(/\/+$/, "").toLowerCase();
             if (chNodes.length === 0) {
-                chNodes = document.querySelectorAll("a[href*='/chapter'], a[href*='/%d8%a7%d9%84%d9%81%d8%b5%d9%84']");
+                var allLinks = document.querySelectorAll("a[href]");
+                var filtered = [];
+                for (var f = 0; f < allLinks.length; f++) {
+                    var link = allLinks[f];
+                    if (link.closest && link.closest("nav, header, footer, .related-manga, .widget-manga-recent")) continue;
+                    var rawH = link.href || "";
+                    var decH = rawH;
+                    try { decH = decodeURIComponent(rawH); } catch (e) {}
+                    var lowH = decH.toLowerCase().split("?")[0].split("#")[0].replace(/\/+$/, "");
+                    var lTxt = (link.innerText || "").trim();
+                    if (!lowH || lowH === baseHref || lowH.indexOf("javascript:") === 0) continue;
+                    if (lowH.indexOf("/genre/") !== -1 || lowH.indexOf("/tag/") !== -1 || lowH.indexOf("/author/") !== -1 || lowH.indexOf("/login") !== -1) continue;
+                    if ((baseHref && lowH.indexOf(baseHref + "/") === 0) ||
+                        lowH.indexOf("chapter") !== -1 ||
+                        lowH.indexOf("فصل") !== -1 ||
+                        lowH.indexOf("الفصل") !== -1 ||
+                        lTxt.indexOf("فصل") !== -1 ||
+                        lTxt.indexOf("الفصل") !== -1 ||
+                        lTxt.toLowerCase().indexOf("chapter") !== -1) {
+                        filtered.push(link);
+                    }
+                }
+                chNodes = filtered;
             }
             for (var j = 0; j < chNodes.length; j++) {
                 var a = chNodes[j];
                 var href = a.href;
                 if (!href || seenCh[href] || href === window.location.href) continue;
-                var li = a.closest("li, tr, .chapter-item, .chbox, .eph-num");
-                var dateEl = (li || a).querySelector(".chapter-release-date, .chapterdate, .date, time, .post-on");
+                var li = a.closest ? a.closest("li, tr, .chapter-item, .chbox, .eph-num, .wp-manga-chapter") : null;
+                var dateEl = (li || a).querySelector ? (li || a).querySelector(".chapter-release-date, .chapterdate, .date, time, .post-on") : null;
                 var dateTxt = dateEl ? dateEl.innerText.trim() : "";
-                var numSpan = a.querySelector(".chapternum, .chapter-title, .name, .epxs");
+                var numSpan = a.querySelector ? a.querySelector(".chapternum, .chapter-title, .chapter-number, .ch-num, .name, .epxs") : null;
                 var txt = "";
                 if (numSpan) {
                     txt = numSpan.innerText.trim();
                 } else {
                     var clone = a.cloneNode(true);
-                    var dNodes = clone.querySelectorAll(".chapter-release-date, .chapterdate, .date, time, .post-on");
+                    var dNodes = clone.querySelectorAll ? clone.querySelectorAll(".chapter-release-date, .chapterdate, .date, time, .post-on") : [];
                     for (var k = 0; k < dNodes.length; k++) dNodes[k].remove();
                     txt = (clone.innerText || "").replace(/\s+/g, " ").trim();
                 }
-                var dataNum = (li && li.getAttribute("data-num")) || a.getAttribute("data-num") || "";
+                if (txt === "أول فصل" || txt === "آخر فصل" || txt === "الفصل الأول" || txt === "الفصل الأخير" || txt === "ابدأ القراءة" || txt === "إبدأ القراءة") {
+                    if (chNodes.length > 2) continue;
+                }
+                var dataNum = (li && li.getAttribute("data-num")) || a.getAttribute("data-num") || (li && li.getAttribute("data-chapter")) || "";
                 seenCh[href] = true;
                 chapters.push({ title: txt, url: href, date: dateTxt, num: dataNum });
             }
@@ -2684,7 +3043,7 @@ object LiveMangaSiteScraper {
                 cover: cover,
                 desc: desc,
                 genres: genres.slice(0, 8),
-                chapters: chapters.slice(0, 1000)
+                chapters: chapters.slice(0, 1500)
             });
         })();
     """.trimIndent()
@@ -3212,39 +3571,85 @@ object LiveMangaSiteScraper {
             lower.startsWith(baseLower)
     }
 
-    private fun isSameWorkContext(chapterUrl: String, mangaPageUrl: String): Boolean {
-        val workSlug = slugFromUrl(mangaPageUrl).lowercase(Locale.ROOT)
-        val lowerCh = chapterUrl.lowercase(Locale.ROOT)
-        return workSlug.length >= 3 && lowerCh.contains(workSlug)
+    private fun decodeUrlSafe(url: String): String {
+        if (url.isBlank()) return ""
+        return try {
+            java.net.URLDecoder.decode(url, "UTF-8")
+        } catch (_: Exception) {
+            url
+        }
     }
 
-    private fun isLikelyChapterUrl(url: String, mangaPageUrl: String): Boolean {
-        val lower = url.lowercase(Locale.ROOT)
-        val basePage = mangaPageUrl.substringBefore("?").substringBefore("#").trimEnd('/').lowercase(Locale.ROOT)
-        if (lower == basePage || lower == "$basePage/") return false
+    private fun isSameWorkContext(chapterUrl: String, mangaPageUrl: String): Boolean {
+        val decodedCh = decodeUrlSafe(chapterUrl).lowercase(Locale.ROOT)
+        val decodedManga = decodeUrlSafe(mangaPageUrl).lowercase(Locale.ROOT)
+        val workSlug = slugFromUrl(decodedManga)
+        if (workSlug.length >= 2 && decodedCh.contains(workSlug)) return true
+        // Also check same host if mangaPageUrl is valid
+        val chHost = runCatching { URI(chapterUrl).host?.lowercase(Locale.ROOT)?.removePrefix("www.").orEmpty() }.getOrDefault("")
+        val mangaHost = runCatching { URI(mangaPageUrl).host?.lowercase(Locale.ROOT)?.removePrefix("www.").orEmpty() }.getOrDefault("")
+        return chHost.isNotBlank() && chHost == mangaHost
+    }
+
+    private fun isRejectedNonChapterUrl(url: String, mangaPageUrl: String): Boolean {
+        val lower = decodeUrlSafe(url).lowercase(Locale.ROOT).trim()
+        if (lower.isBlank()) return true
+        val normCh = normalizeChapterUrlKey(lower)
+        val normBase = normalizeChapterUrlKey(decodeUrlSafe(mangaPageUrl))
+        if (normCh == normBase) return true
         val rejectedSegments = listOf(
             "/wp-login", "/wp-admin", "/login", "/register", "/contact", "/privacy",
             "/terms", "/dmca", "/tag/", "/manga-genre/", "/genre/", "/author/", "/artist/",
-            "?page=", "?chpage=", "/page/", "#respond", "#comments", "javascript:"
+            "/status/", "/type/", "/release/", "?page=", "?chpage=", "?cpage=", "/page/",
+            "#respond", "#comments", "javascript:", "mailto:", "tel:", "discord.gg",
+            "facebook.com", "twitter.com", "instagram.com", "t.me/"
         )
-        if (rejectedSegments.any { lower.contains(it) }) return false
+        return rejectedSegments.any { lower.contains(it) }
+    }
 
-        if (basePage.isNotBlank() && lower.startsWith("$basePage/") && lower.length > basePage.length + 1) {
+    private fun isLikelyChapterUrl(url: String, mangaPageUrl: String): Boolean {
+        if (isRejectedNonChapterUrl(url, mangaPageUrl)) return false
+        val lower = decodeUrlSafe(url).lowercase(Locale.ROOT)
+        val basePage = decodeUrlSafe(mangaPageUrl).substringBefore("?").substringBefore("#").trimEnd('/').lowercase(Locale.ROOT)
+
+        // Compare normalized scheme/www-agnostic base URL prefix
+        val normUrl = normalizeChapterUrlKey(lower)
+        val normBase = normalizeChapterUrlKey(basePage)
+        if (normBase.isNotBlank() && normUrl.startsWith("$normBase/") && normUrl.length > normBase.length + 1) {
             return true
         }
+
         val workSlug = slugFromUrl(basePage)
-        if (workSlug.length >= 3 && lower.contains(workSlug)) {
-            if (lower.contains("chapter") || lower.contains("فصل") || lower.contains("الفصل") ||
-                Regex("""/\d+(?:[._-]\d+)?/?$""").containsMatchIn(lower)
+        // If both mangaPageUrl and candidate URL follow /series/{slug}/... or /manga/{slug}/..., ensure {slug} matches workSlug
+        val seriesSlugRegex = Regex("""/(?:series|manga|manhwa|comic|work)/([^/?#]+)/([^/?#]+)""")
+        val candidateMatch = seriesSlugRegex.find(lower)
+        if (candidateMatch != null) {
+            val candSlug = candidateMatch.groupValues[1]
+            val candSub = candidateMatch.groupValues[2]
+            if (workSlug.length >= 2 && candSlug != workSlug) {
+                return false
+            }
+            if (candSub.contains("chapter") || candSub.contains("ch") || candSub.contains("فصل") || candSub.contains("الفصل") ||
+                Regex("""^\d+(?:[._-]\d+)?$""").matches(candSub)
             ) {
                 return true
             }
         }
+
+        if (workSlug.length >= 2 && lower.contains(workSlug)) {
+            if (lower.contains("chapter") || lower.contains("فصل") || lower.contains("الفصل") ||
+                Regex("""[-_/]\d+(?:[._-]\d+)?/?$""").containsMatchIn(lower)
+            ) {
+                return true
+            }
+        }
+
         return lower.contains("/chapter") ||
+            lower.contains("-chapter-") ||
             lower.contains("الفصل") ||
-            lower.contains("/read/") ||
-            Regex("""/series/[^/]+/\d+""").containsMatchIn(lower) ||
-            Regex("""/manga/[^/]+/(?:chapter|ch|فصل|الفصل|\d+)""").containsMatchIn(lower)
+            lower.contains("/فصل-") ||
+            lower.contains("-فصل-") ||
+            lower.contains("/read/")
     }
 
     internal fun normalizeChapterUrlKey(url: String): String {

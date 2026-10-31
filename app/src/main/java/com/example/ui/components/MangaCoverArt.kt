@@ -40,6 +40,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -1033,7 +1034,16 @@ fun HiddenSiteWebViewBridge(
 
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
 
-    DisposableEffect(targetUrl, reloadTrigger) {
+    LaunchedEffect(targetUrl, reloadTrigger) {
+        if (reloadTrigger > 0) {
+            try {
+                webViewRef?.loadUrl(targetUrl)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    DisposableEffect(targetUrl) {
         onDispose {
             try {
                 webViewRef?.stopLoading()
@@ -1068,21 +1078,24 @@ fun HiddenSiteWebViewBridge(
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             CookieManager.getInstance().flush()
-                            // Trigger scroll events so lazy-load scripts populate data-src / src attributes
+                            // Trigger scroll events & click "show more chapters" buttons so lazy-load / AJAX scripts populate DOM
                             view?.evaluateJavascript(
-                                "(function(){ try { window.scrollTo(0, 1200); window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0); } catch(e){} })();",
+                                "(function(){ try { var btns = document.querySelectorAll('.chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters'); for(var i=0;i<btns.length;i++){ if(btns[i].click) btns[i].click(); } window.scrollTo(0, 1200); window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0); } catch(e){} })();",
                                 null
                             )
-                            view?.postDelayed({
-                                try {
-                                    view.evaluateJavascript(jsExtractorScript) { rawJson ->
-                                        if (!rawJson.isNullOrBlank() && rawJson != "null") {
-                                            onResultJson(rawJson)
+                            val pollDelays = listOf(450L, 1400L, 2800L)
+                            for (delayMs in pollDelays) {
+                                view?.postDelayed({
+                                    try {
+                                        view.evaluateJavascript(jsExtractorScript) { rawJson ->
+                                            if (!rawJson.isNullOrBlank() && rawJson != "null") {
+                                                onResultJson(rawJson)
+                                            }
                                         }
+                                    } catch (_: Exception) {
                                     }
-                                } catch (_: Exception) {
-                                }
-                            }, 450L)
+                                }, delayMs)
+                            }
                         }
                     }
                     webViewRef = this

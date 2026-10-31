@@ -424,6 +424,9 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onSelectSiteForSearch = { site ->
                             viewModel.openSiteCatalog(site)
                         },
+                        onWorkDetailsUpdated = { updatedWork ->
+                            viewModel.updateSelectedWorkDetails(updatedWork)
+                        },
                         onShowToast = { msg -> viewModel.showToast(msg) }
                     )
                 }
@@ -630,8 +633,8 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         categories = categories,
                         appLockPin = settings.appLockPin,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
-                        onOpenFavoriteUrl = { _, _ ->
-                            viewModel.openMangaDetails(selectedWork)
+                        onOpenFavoriteUrl = { title, url ->
+                            viewModel.openMangaDetailsFromUrl(title, url)
                         },
                         onRemoveFavorite = { fav -> viewModel.removeFavorite(fav) },
                         onUpdateFavoriteCategory = { fav, newCat ->
@@ -648,8 +651,8 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                     HistoryScreen(
                         historyItems = history,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
-                        onOpenHistoryUrl = { _, _ ->
-                            viewModel.openMangaDetails(selectedWork)
+                        onOpenHistoryUrl = { title, url ->
+                            viewModel.openMangaDetailsFromUrl(title, url)
                         },
                         onDeleteHistoryItem = { id -> viewModel.deleteHistoryEntry(id) },
                         onClearAllHistory = { viewModel.clearAllHistory() }

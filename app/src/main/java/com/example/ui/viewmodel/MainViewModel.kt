@@ -371,35 +371,55 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
 
     fun openMangaDetails(work: MangaWork) {
         viewModelScope.launch {
-            // Merge any locally downloaded chapters for this work so offline/downloaded badges work seamlessly
+            // Merge any locally downloaded chapters for this work without wiping out remote chapters
             val localWorkEntity = repository.dao.getDownloadedWorkById(work.id)
-            val mergedWork = if (work.isFromLocalStorage && localWorkEntity != null) {
-                repository.buildOfflineMangaWorkFromEntity(localWorkEntity)
-            } else if (localWorkEntity != null) {
+            val mergedWork = if (localWorkEntity != null) {
                 val offlineBuilt = repository.buildOfflineMangaWorkFromEntity(localWorkEntity)
                 val offlineChByNumber = offlineBuilt.chapters.associateBy { it.number }
                 val mergedChapters = if (work.chapters.isEmpty()) {
                     offlineBuilt.chapters
                 } else {
-                    work.chapters.map { ch ->
+                    val map = LinkedHashMap<Int, MangaChapter>()
+                    for (ch in work.chapters) {
                         val localCh = offlineChByNumber[ch.number]
-                        if (localCh != null && localCh.localPagePaths.isNotEmpty()) {
-                            ch.copy(
+                        if (localCh != null && (localCh.localPagePaths.isNotEmpty() || localCh.isDownloaded)) {
+                            map[ch.number] = ch.copy(
                                 localPagePaths = localCh.localPagePaths,
+                                downloadedPagesCount = localCh.downloadedPagesCount.coerceAtLeast(localCh.localPagePaths.size),
+                                pageCount = localCh.pageCount.coerceAtLeast(ch.pageCount),
+                                isDownloaded = localCh.isDownloaded,
                                 downloadStatus = localCh.downloadStatus,
+                                downloadError = localCh.downloadError,
                                 lastReadPage = localCh.lastReadPage,
                                 lastReadTimeText = localCh.lastReadTimeText,
                                 chapterKey = localCh.chapterKey
                             )
                         } else {
-                            ch
+                            map[ch.number] = ch
                         }
                     }
+                    for (localCh in offlineBuilt.chapters) {
+                        if (!map.containsKey(localCh.number)) {
+                            map[localCh.number] = localCh
+                        }
+                    }
+                    map.values.sortedWith(
+                        compareBy<MangaChapter> { it.chapterNumberValue }
+                            .thenBy { it.number }
+                    )
                 }
                 work.copy(
+                    title = work.title.ifBlank { offlineBuilt.title },
+                    mangaUrl = work.mangaUrl.ifBlank { offlineBuilt.mangaUrl },
+                    siteUrl = work.siteUrl.ifBlank { offlineBuilt.siteUrl },
+                    siteName = work.siteName.ifBlank { offlineBuilt.siteName },
+                    coverImageUrl = work.coverImageUrl ?: offlineBuilt.coverImageUrl,
+                    description = work.description.ifBlank { offlineBuilt.description },
+                    genres = work.genres.ifEmpty { offlineBuilt.genres },
                     localCoverPath = localWorkEntity.localCoverPath.ifBlank { work.localCoverPath },
-                    storageSizeBytes = localWorkEntity.totalStorageBytes,
-                    chapters = mergedChapters
+                    storageSizeBytes = localWorkEntity.totalStorageBytes.coerceAtLeast(work.storageSizeBytes),
+                    chapters = mergedChapters,
+                    chaptersCount = maxOf(mergedChapters.size, work.chaptersCount, offlineBuilt.chaptersCount)
                 )
             } else {
                 work
@@ -418,14 +438,80 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
         }
     }
 
+    fun updateSelectedWorkDetails(updatedWork: MangaWork) {
+        if (_selectedWork.value.id == updatedWork.id || _selectedWork.value.mangaUrl == updatedWork.mangaUrl) {
+            _selectedWork.value = updatedWork
+            if (updatedWork.chapters.isNotEmpty() && _selectedChapter.value.chapterUrl.isBlank()) {
+                _selectedChapter.value = updatedWork.chapters.first()
+            }
+        }
+        if (updatedWork.chapters.isNotEmpty()) {
+            viewModelScope.launch {
+                val existingEntity = repository.dao.getDownloadedWorkById(updatedWork.id)
+                if (existingEntity != null && updatedWork.chapters.size > existingEntity.totalChaptersOnSite) {
+                    repository.dao.upsertDownloadedWork(
+                        existingEntity.copy(
+                            totalChaptersOnSite = updatedWork.chapters.size,
+                            synopsis = updatedWork.description.ifBlank { existingEntity.synopsis }
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    fun openMangaDetailsFromUrl(title: String, url: String, siteName: String = "") {
+        viewModelScope.launch {
+            val cleanUrl = url.trim()
+            if (cleanUrl.isBlank()) {
+                openMangaDetails(_selectedWork.value)
+                return@launch
+            }
+            val slug = cleanUrl.trimEnd('/').substringBefore("?").substringAfterLast("/").ifBlank {
+                "work_${cleanUrl.hashCode()}"
+            }
+            val localEntity = repository.dao.getDownloadedWorkById(slug)
+                ?: downloadedWorks.value.find { it.mangaUrl.equals(cleanUrl, ignoreCase = true) || it.title.equals(title, ignoreCase = true) }
+            if (localEntity != null) {
+                val offlineWork = repository.buildOfflineMangaWorkFromEntity(localEntity)
+                openMangaDetails(offlineWork)
+                return@launch
+            }
+
+            val matchedSite = sites.value.find { s ->
+                (s.domain.isNotBlank() && cleanUrl.contains(s.domain, ignoreCase = true)) ||
+                    (siteName.isNotBlank() && s.name.equals(siteName, ignoreCase = true))
+            } ?: _selectedSite.value
+
+            val allCatalogWorks = MangaCatalogData.defaultAddedSites.flatMap { MangaCatalogData.getCatalogForSite(it) } +
+                MangaCatalogData.storageLibraryWorks
+            val catalogMatch = allCatalogWorks.find {
+                it.mangaUrl.equals(cleanUrl, ignoreCase = true) ||
+                    it.id.equals(slug, ignoreCase = true) ||
+                    (title.isNotBlank() && it.title.equals(title, ignoreCase = true))
+            }
+            if (catalogMatch != null) {
+                openMangaDetails(catalogMatch.copy(mangaUrl = cleanUrl.ifBlank { catalogMatch.mangaUrl }))
+                return@launch
+            }
+
+            val constructedWork = MangaWork(
+                id = slug,
+                title = title.ifBlank { slug.replace("-", " ") },
+                mangaUrl = cleanUrl,
+                sourceId = matchedSite.id,
+                siteName = siteName.ifBlank { matchedSite.name },
+                siteUrl = matchedSite.url,
+                siteIconKey = matchedSite.iconKey
+            )
+            openMangaDetails(constructedWork)
+        }
+    }
+
     fun openDownloadedWorkFromStorage(entity: DownloadedWorkEntity) {
         viewModelScope.launch {
             val offlineWork = repository.buildOfflineMangaWorkFromEntity(entity)
-            _selectedWork.value = offlineWork
-            if (offlineWork.chapters.isNotEmpty()) {
-                _selectedChapter.value = offlineWork.chapters.first()
-            }
-            navigateTo(AppScreen.MANGA_DETAILS)
+            openMangaDetails(offlineWork)
         }
     }
 
