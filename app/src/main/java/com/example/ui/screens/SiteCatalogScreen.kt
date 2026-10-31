@@ -161,8 +161,16 @@ fun SiteCatalogScreen(
     var isLoadingMoreCatalog by remember(site.id, site.url) { mutableStateOf(false) }
     var hasMoreCatalogPages by remember(site.id, site.url) { mutableStateOf(true) }
     var requiresCloudflare by remember(site.id, site.url) { mutableStateOf(false) }
+    var hasAutoOpenedProtection by remember(site.id, site.url) { mutableStateOf(false) }
     var errorMessage by remember(site.id, site.url) { mutableStateOf<String?>(null) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(requiresCloudflare, liveWorks.size) {
+        if (requiresCloudflare && liveWorks.isEmpty() && !hasAutoOpenedProtection) {
+            hasAutoOpenedProtection = true
+            showProtectionDialog = true
+        }
+    }
 
     // Latest Updates state for this site
     var siteLatestUpdates by remember(site.id, site.url) { mutableStateOf(cachedSiteUpdates) }
@@ -278,6 +286,9 @@ fun SiteCatalogScreen(
                 siteUpdatesShowingCachedOffline = true
             }
             siteUpdatesError = result.errorMessage ?: "تعذر جلب آخر التحديثات من ${site.name}"
+            if (result.requiresCloudflare && liveWorks.isEmpty() && siteLatestUpdates.isEmpty()) {
+                requiresCloudflare = true
+            }
         }
         isLoadingSiteUpdates = false
     }
@@ -1301,7 +1312,7 @@ fun SiteCatalogScreen(
     // Interactive Cloudflare Protection & Live DOM Verification Modal
     if (showProtectionDialog) {
         CloudflareProtectionDialog(
-            url = targetCatalogUrl,
+            url = if (activeSectionTab == "UPDATES") site.url else targetCatalogUrl,
             siteName = site.name,
             jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CATALOG,
             onExtractedDomJson = { rawJson ->
@@ -1310,12 +1321,45 @@ fun SiteCatalogScreen(
                     liveWorks = domResult.works
                     requiresCloudflare = false
                     errorMessage = null
+                    isLoadingCatalog = false
+                    isLoadingMoreCatalog = false
+                    if (siteLatestUpdates.isEmpty()) {
+                        val now = System.currentTimeMillis()
+                        val fallbackUpdates = domResult.works.mapIndexed { idx, w ->
+                            com.example.data.MangaLatestUpdateItem(
+                                updateKey = "${site.id}_${w.id}_latest_$idx",
+                                sourceId = site.id,
+                                sourceName = site.name,
+                                sourceUrl = site.url,
+                                siteIconKey = site.iconKey,
+                                workId = w.id,
+                                workTitle = w.title,
+                                mangaUrl = w.mangaUrl,
+                                coverImageUrl = w.effectiveCoverUrl,
+                                chapterId = "${w.id}_ch_1",
+                                chapterTitle = "أحدث فصل",
+                                chapterNumber = 1,
+                                chapterNumberValue = 1.0,
+                                chapterNumberLabel = "1",
+                                chapterUrl = w.mangaUrl,
+                                publishDateText = "حديثاً",
+                                publishedAtEpochMillis = now - idx * 60_000L,
+                                isDateAvailable = true,
+                                originalOrderIndex = idx,
+                                syncedAt = now
+                            )
+                        }
+                        siteLatestUpdates = fallbackUpdates
+                        siteUpdatesError = null
+                        isLoadingSiteUpdates = false
+                    }
                 }
             },
             onDismissAndRefresh = {
                 showProtectionDialog = false
                 refreshTrigger++
-                onShowToast("تم تحديث جلسة الحماية وجلب المانجا من الموقع")
+                siteUpdatesRefreshTrigger++
+                onShowToast("تم تحديث جلسة التحقق وعرض المانجا داخل التطبيق")
             }
         )
     }

@@ -38,6 +38,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -48,6 +49,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.SwapVert
@@ -142,6 +144,8 @@ fun MangaDetailsScreen(
     onRemoveWorkFromStorage: (String) -> Unit = {},
     onOpenInWebView: (String, String) -> Unit,
     onSelectSiteForSearch: ((SiteEntity) -> Unit)? = null,
+    onMarkChaptersReadBatch: (MangaWork, List<Int>, Boolean) -> Unit = { _, _, _ -> },
+    onOpenAlternativeSourceChapter: (MangaWork, Int) -> Unit = { _, _ -> },
     onWorkDetailsUpdated: (MangaWork) -> Unit = {},
     onShowToast: (String) -> Unit
 ) {
@@ -175,11 +179,24 @@ fun MangaDetailsScreen(
     var isLoadingChapters by remember(work.id, targetMangaUrl) {
         mutableStateOf(liveWork.chapters.isEmpty() && hasValidRemoteUrl)
     }
+    var requiresCloudflare by remember(work.id, targetMangaUrl) { mutableStateOf(false) }
+    var showProtectionDialog by remember(work.id, targetMangaUrl) { mutableStateOf(false) }
+    var hasAutoOpenedProtection by remember(work.id, targetMangaUrl) { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(requiresCloudflare, liveWork.chapters.size) {
+        if (requiresCloudflare && liveWork.chapters.isEmpty() && !hasAutoOpenedProtection) {
+            hasAutoOpenedProtection = true
+            showProtectionDialog = true
+        }
+    }
 
     var isChaptersReversed by remember { mutableStateOf(false) }
     var chapterFilterMode by remember { mutableStateOf("الكل") } // الكل | غير المقروءة | المحملة
     var chapterJumpQuery by remember { mutableStateOf("") }
+    var showChapterSearchBar by remember { mutableStateOf(false) }
+    var isMultiSelectMode by remember { mutableStateOf(false) }
+    var selectedChapterNums by remember(work.id) { mutableStateOf(setOf<Int>()) }
     val chaptersListState = rememberLazyListState()
     var activeChapterMenuId by remember { mutableStateOf<String?>(null) }
     var showOverflowMenu by remember { mutableStateOf(false) }
@@ -252,8 +269,12 @@ fun MangaDetailsScreen(
             )
             liveWork = updated
             onWorkDetailsUpdated(updated)
+            requiresCloudflare = false
             isLoadingChapters = false
         } else {
+            if (res.requiresCloudflare && liveWork.chapters.isEmpty()) {
+                requiresCloudflare = true
+            }
             isLoadingChapters = false
         }
     }
@@ -316,6 +337,10 @@ fun MangaDetailsScreen(
                     LiveMangaSiteScraper.cacheWorkDetails(updated)
                     liveWork = updated
                     onWorkDetailsUpdated(updated)
+                    requiresCloudflare = false
+                    isLoadingChapters = false
+                } else if (domRes.requiresCloudflare && liveWork.chapters.isEmpty()) {
+                    requiresCloudflare = true
                     isLoadingChapters = false
                 }
             }
@@ -765,19 +790,60 @@ fun MangaDetailsScreen(
                 .fillMaxHeight()
                 .background(AppBackgroundDark)
         ) {
-            // Top "الفصول" Tab Header
+            // Top "الفصول" Tab Header + Quick Search & Multi-Select Icons
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    text = "الفصول",
-                    color = PeriwinklePrimary,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    IconButton(
+                        onClick = { showChapterSearchBar = !showChapterSearchBar },
+                        modifier = Modifier
+                            .size(32.dp)
+                            .testTag("toggle_chapter_search_btn")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Search,
+                            contentDescription = "بحث سريع عن رقم الفصل",
+                            tint = if (showChapterSearchBar || chapterJumpQuery.isNotBlank()) PeriwinklePrimary else TextSecondaryGrey,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    Text(
+                        text = "الفصول",
+                        color = PeriwinklePrimary,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    IconButton(
+                        onClick = {
+                            isMultiSelectMode = !isMultiSelectMode
+                            if (!isMultiSelectMode) {
+                                selectedChapterNums = emptySet()
+                            } else {
+                                onShowToast("وضع التحديد المتعدد: اضغط على الفصول لتحديدها كمقروءة أو تحميلها")
+                            }
+                        },
+                        modifier = Modifier
+                            .size(32.dp)
+                            .testTag("toggle_multi_select_chapters_btn")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DoneAll,
+                            contentDescription = "تحديد متعدد للفصول",
+                            tint = if (isMultiSelectMode) PeriwinklePrimary else TextSecondaryGrey,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
                 Box(
                     modifier = Modifier
                         .width(52.dp)
@@ -885,6 +951,36 @@ fun MangaDetailsScreen(
                         Spacer(modifier = Modifier.height(12.dp))
                         OutlinedButton(onClick = { refreshTrigger++ }) {
                             Text("إعادة المحاولة", color = TextPrimaryWhite, fontSize = 12.sp)
+                        }
+                        if (hasValidRemoteUrl) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = { showProtectionDialog = true },
+                                border = BorderStroke(1.dp, Color(0xFFFFB74D).copy(alpha = 0.8f)),
+                                modifier = Modifier.testTag("empty_chapters_verify_site_btn")
+                            ) {
+                                Text(
+                                    text = "تخطي التحقق وعرض الفصول بالتطبيق 🛡️",
+                                    color = Color(0xFFFFB74D),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { onOpenAlternativeSourceChapter(liveWork, 1) },
+                            border = BorderStroke(1.dp, PeriwinklePrimary.copy(alpha = 0.6f)),
+                            modifier = Modifier.testTag("empty_chapters_alt_source_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Public,
+                                contentDescription = null,
+                                tint = PeriwinklePrimary,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("فتح من مصدر بديل", color = PeriwinklePrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                 } else {
@@ -994,11 +1090,11 @@ fun MangaDetailsScreen(
                             }
                         }
 
-                        if (baseChaptersToDisplay.size >= 6) {
+                        if (showChapterSearchBar || chapterJumpQuery.isNotBlank()) {
                             OutlinedTextField(
                                 value = chapterJumpQuery,
                                 onValueChange = { chapterJumpQuery = it },
-                                placeholder = { Text("ابحث عن رقم الفصل...", fontSize = 11.sp) },
+                                placeholder = { Text("اكتب رقم الفصل (مثلاً 120) للقفز إليه...", fontSize = 11.sp) },
                                 singleLine = true,
                                 colors = OutlinedTextFieldDefaults.colors(
                                     focusedBorderColor = PeriwinklePrimary,
@@ -1011,6 +1107,138 @@ fun MangaDetailsScreen(
                                     .padding(horizontal = 8.dp, vertical = 2.dp)
                                     .testTag("chapter_jump_input")
                             )
+                        }
+
+                        // Multi-Select Batch Action Bar ("تحديد عدة فصول دفعة واحدة كمقروءة أو للتحميل")
+                        if (isMultiSelectMode) {
+                            Surface(
+                                color = Color(0xFF1A1E2B),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, PeriwinklePrimary.copy(alpha = 0.45f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .testTag("chapters_multi_select_bar")
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            Surface(
+                                                color = Color(0xFF262B3C),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.clickable {
+                                                    selectedChapterNums = chaptersToDisplay.map { it.number }.toSet()
+                                                }
+                                            ) {
+                                                Text(
+                                                    text = "الكل",
+                                                    color = TextPrimaryWhite,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+                                                )
+                                            }
+                                            Surface(
+                                                color = Color(0xFF262B3C),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.clickable {
+                                                    selectedChapterNums = chaptersToDisplay
+                                                        .filter { it.number !in readChapterNumbers && !it.isRead }
+                                                        .map { it.number }
+                                                        .toSet()
+                                                }
+                                            ) {
+                                                Text(
+                                                    text = "غير المقروء",
+                                                    color = TextPrimaryWhite,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+                                                )
+                                            }
+                                            if (selectedChapterNums.isNotEmpty()) {
+                                                Surface(
+                                                    color = Color(0xFF262B3C),
+                                                    shape = RoundedCornerShape(8.dp),
+                                                    modifier = Modifier.clickable { selectedChapterNums = emptySet() }
+                                                ) {
+                                                    Text(
+                                                        text = "مسح",
+                                                        color = Color(0xFFFF8A80),
+                                                        fontSize = 10.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        Text(
+                                            text = "محدد: ${selectedChapterNums.size}",
+                                            color = PeriwinklePrimary,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Button(
+                                            onClick = {
+                                                if (selectedChapterNums.isNotEmpty()) {
+                                                    onMarkChaptersReadBatch(liveWork, selectedChapterNums.toList(), true)
+                                                    selectedChapterNums = emptySet()
+                                                    isMultiSelectMode = false
+                                                } else {
+                                                    onShowToast("حدد فصلاً واحداً على الأقل أولاً")
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = PeriwinklePrimary,
+                                                contentColor = PeriwinkleOnPrimary
+                                            ),
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(30.dp)
+                                                .testTag("batch_mark_read_btn")
+                                        ) {
+                                            Text("تحديد كمقروء ✓", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                        OutlinedButton(
+                                            onClick = {
+                                                if (selectedChapterNums.isNotEmpty()) {
+                                                    val batchChs = liveWork.chapters.filter { it.number in selectedChapterNums }
+                                                    onDownloadChapters(
+                                                        liveWork,
+                                                        batchChs,
+                                                        "بدأ تنزيل ${batchChs.size} فصل محدد..."
+                                                    )
+                                                    selectedChapterNums = emptySet()
+                                                    isMultiSelectMode = false
+                                                } else {
+                                                    onShowToast("حدد فصلاً واحداً على الأقل أولاً")
+                                                }
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(30.dp)
+                                                .testTag("batch_download_selected_btn")
+                                        ) {
+                                            Text("تحميل المحدد ⬇", color = PeriwinklePrimary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         LazyColumn(
@@ -1041,14 +1269,29 @@ fun MangaDetailsScreen(
                             val isDownloading = effectiveStatus == "DOWNLOADING" || effectiveStatus == "QUEUED"
                             val isIncomplete = !isSaved && (effectiveStatus == "INCOMPLETE" || effectiveStatus == "FAILED")
                             val isRead = (chapter.number in readChapterNumbers) || chapter.isRead || (chapter.lastReadPage >= 0)
+                            val isSelectedInBatch = isMultiSelectMode && (chapter.number in selectedChapterNums)
                             val showMenuForThis = activeChapterMenuId == chapter.id
 
-                            Box(modifier = Modifier.fillMaxWidth()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(if (isSelectedInBatch) PeriwinklePrimary.copy(alpha = 0.14f) else Color.Transparent)
+                            ) {
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .combinedClickable(
-                                            onClick = { onOpenChapter(liveWork, chapter) },
+                                            onClick = {
+                                                if (isMultiSelectMode) {
+                                                    selectedChapterNums = if (chapter.number in selectedChapterNums) {
+                                                        selectedChapterNums - chapter.number
+                                                    } else {
+                                                        selectedChapterNums + chapter.number
+                                                    }
+                                                } else {
+                                                    onOpenChapter(liveWork, chapter)
+                                                }
+                                            },
                                             onLongClick = { activeChapterMenuId = chapter.id }
                                         )
                                         .padding(horizontal = 10.dp, vertical = 10.dp)
@@ -1292,6 +1535,34 @@ fun MangaDetailsScreen(
                                         onClick = {
                                             activeChapterMenuId = null
                                             onExportChapterPdf(liveWork, chapter)
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = if (isRead) "إلغاء تحديد الفصل كمقروء" else "تحديد هذا الفصل كمقروء ✓",
+                                                color = TextPrimaryWhite,
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        },
+                                        onClick = {
+                                            activeChapterMenuId = null
+                                            onMarkChaptersReadBatch(liveWork, listOf(chapter.number), !isRead)
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = "فتح الفصل من مصدر عربي بديل 🌐",
+                                                color = PeriwinklePrimary,
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        },
+                                        onClick = {
+                                            activeChapterMenuId = null
+                                            onOpenAlternativeSourceChapter(liveWork, chapter.number)
                                         }
                                     )
                                     DropdownMenuItem(
@@ -2028,6 +2299,37 @@ fun MangaDetailsScreen(
                 TextButton(onClick = { showSearchInSitesDialog = false }) {
                     Text("إغلاق", color = PeriwinklePrimary)
                 }
+            }
+        )
+    }
+
+    if (showProtectionDialog && hasValidRemoteUrl) {
+        CloudflareProtectionDialog(
+            url = targetMangaUrl,
+            siteName = liveWork.siteName.ifBlank { "الموقع" },
+            jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_DETAILS,
+            onExtractedDomJson = { rawJson ->
+                val domRes = LiveMangaSiteScraper.parseDetailsFromDomJson(rawJson, liveWork)
+                if (domRes.work.chapters.isNotEmpty() || domRes.work.description.isNotBlank()) {
+                    val mergedChs = mergeRemoteAndLocalChapters(domRes.work.chapters, liveWork.chapters)
+                    val updated = domRes.work.copy(
+                        localCoverPath = liveWork.localCoverPath,
+                        isFromLocalStorage = liveWork.isFromLocalStorage,
+                        storageSizeBytes = liveWork.storageSizeBytes,
+                        chapters = mergedChs,
+                        chaptersCount = maxOf(mergedChs.size, domRes.work.chaptersCount, liveWork.chaptersCount)
+                    )
+                    LiveMangaSiteScraper.cacheWorkDetails(updated)
+                    liveWork = updated
+                    onWorkDetailsUpdated(updated)
+                    requiresCloudflare = false
+                    isLoadingChapters = false
+                }
+            },
+            onDismissAndRefresh = {
+                showProtectionDialog = false
+                refreshTrigger++
+                onShowToast("تم تخطي التحقق وعرض فصول المانجا داخل التطبيق")
             }
         )
     }

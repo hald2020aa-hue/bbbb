@@ -93,5 +93,44 @@ class ExampleUnitTest {
         assertEquals(2, chapters.size)
         assertEquals(listOf(11, 12), chapters.map { it.number })
     }
+
+    @Test
+    fun parseChapters_singleChapterGalleryWith12PageThumbnails_returnsSingleChapterWith12Pages() {
+        val thumbsHtml = (1..12).joinToString("\n") { pageNum ->
+            """
+            <div class="thumb-container">
+                <a class="gallerythumb" href="/g/485123/$pageNum/">
+                    <img src="https://t3.nhentai.net/galleries/2999111/${pageNum}t.jpg" data-src="https://t3.nhentai.net/galleries/2999111/${pageNum}t.jpg" />
+                </a>
+            </div>
+            """.trimIndent()
+        }
+        val html = """
+            <div id="info">
+                <h1>ブルア... [えだまめ亭 (よろず)]</h1>
+                <div class="tags">
+                    <a href="/tag/doujinshi/" class="tag">Doujinshi</a>
+                </div>
+            </div>
+            <div class="container" id="thumbnail-container">
+                $thumbsHtml
+            </div>
+        """.trimIndent()
+
+        val pageUrl = "https://nhentai.net/g/485123/"
+        val multiChapters = LiveMangaSiteScraper.parseChaptersFromHtmlFragment(
+            html = html,
+            workId = "g_485123",
+            pageUrl = pageUrl
+        )
+        // Page thumbnails /1/ .. /12/ inside #thumbnail-container must NOT be mistaken for 12 separate chapters
+        assertTrue("Page thumbnails should not be parsed as separate chapters", multiChapters.isEmpty())
+
+        // And single-chapter gallery extractor should collect all 12 full-resolution pages into 1 chapter
+        val galleryPages = LiveMangaSiteScraper.extractSingleChapterGalleryPages(html, pageUrl)
+        assertEquals(12, galleryPages.size)
+        assertEquals("https://i3.nhentai.net/galleries/2999111/1.jpg", galleryPages.first())
+        assertEquals("https://i3.nhentai.net/galleries/2999111/12.jpg", galleryPages.last())
+    }
 }
 

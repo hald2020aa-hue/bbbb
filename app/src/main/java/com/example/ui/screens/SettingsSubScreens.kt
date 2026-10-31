@@ -80,6 +80,11 @@ fun StorageSettingsScreen(
     onUpdateString: (String, String) -> Unit = { _, _ -> },
     onUpdateInt: (String, Int) -> Unit = { _, _ -> },
     onCleanReadChaptersNow: () -> Unit = {},
+    onCompressExistingChaptersWebp: () -> Unit = {},
+    onExportFullBackupUri: (android.net.Uri) -> Unit = {},
+    onImportFullBackupUri: (android.net.Uri) -> Unit = {},
+    onCreateBackupInternal: () -> Unit = {},
+    onRestoreBackupInternal: () -> Unit = {},
     onBackClick: () -> Unit,
     onClearCache: () -> Unit,
     onClearSearchHistory: () -> Unit,
@@ -88,6 +93,22 @@ fun StorageSettingsScreen(
     var showMoveStorageDialog by remember { mutableStateOf(false) }
     var showPreferredFormatDialog by remember { mutableStateOf(false) }
     var showMaxDownloadsDialog by remember { mutableStateOf(false) }
+
+    val exportBackupLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: android.net.Uri? ->
+        if (uri != null) {
+            onExportFullBackupUri(uri)
+        }
+    }
+
+    val importBackupLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri: android.net.Uri? ->
+        if (uri != null) {
+            onImportFullBackupUri(uri)
+        }
+    }
 
     // Exact screen from 01:20-01:22
     Column(
@@ -358,6 +379,26 @@ fun StorageSettingsScreen(
             onCheckedChange = { onUpdateBoolean("compressDownloadsWebp", it) }
         )
 
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.End
+        ) {
+            OutlinedButton(
+                onClick = onCompressExistingChaptersWebp,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.testTag("compress_existing_webp_btn")
+            ) {
+                Text(
+                    text = "ضغط الفصول المحمّلة الحالية بصيغة WebP ⚡",
+                    color = PeriwinklePrimary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
         // Nightly / Charging Download Schedule
         SettingsSwitchItem(
             title = "جدولة التنزيلات الليلية وعند الشحن",
@@ -365,6 +406,65 @@ fun StorageSettingsScreen(
             checked = settings.nightlyDownloadScheduleEnabled,
             onCheckedChange = { onUpdateBoolean("nightlyDownloadScheduleEnabled", it) }
         )
+
+        HorizontalDivider(color = AppDividerColor, thickness = 1.dp, modifier = Modifier.padding(vertical = 8.dp))
+
+        Text(
+            text = "النسخ الاحتياطي الكامل والاستعادة (JSON)",
+            color = PeriwinklePrimary,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp)
+        )
+
+        Text(
+            text = "احفظ نسخة احتياطية شاملة (المفضلة، الفئات، سجل وتقدم القراءة بالبكسل، والمواقع المضافة) لاستعادتها عند تغيير الهاتف أو إعادة تثبيت التطبيق.",
+            color = TextSecondaryGrey,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Button(
+                onClick = {
+                    onCreateBackupInternal()
+                    runCatching {
+                        exportBackupLauncher.launch("manga_browser_backup.json")
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = PeriwinklePrimary,
+                    contentColor = PeriwinkleOnPrimary
+                ),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("export_full_backup_json_btn")
+            ) {
+                Text("تصدير نسخة JSON 📤", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+
+            OutlinedButton(
+                onClick = {
+                    onRestoreBackupInternal()
+                    runCatching {
+                        importBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                    }
+                },
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("import_full_backup_json_btn")
+            ) {
+                Text("استيراد نسخة JSON 📥", color = PeriwinklePrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+        Spacer(modifier = Modifier.height(24.dp))
     }
 
     if (showPreferredFormatDialog) {

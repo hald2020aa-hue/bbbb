@@ -271,6 +271,7 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                     StorageLibraryScreen(
                         savedWorks = savedWorks,
                         downloadedWorks = downloadedWorks,
+                        readChaptersMap = readChaptersMap,
                         showContinueReadingButton = settings.showContinueReadingButton,
                         lastReadWorkTitle = latestProg?.workTitle ?: "",
                         lastReadChapterNumber = latestProg?.chapterNumber ?: 0,
@@ -299,7 +300,8 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                             viewModel.resumeReadingCurrentOrLastWork()
                         },
                         onOpenDownloadsScreen = { viewModel.navigateTo(AppScreen.DOWNLOADS) },
-                        onOpenStorageSettings = { viewModel.navigateTo(AppScreen.SETTINGS_STORAGE) }
+                        onOpenStorageSettings = { viewModel.navigateTo(AppScreen.SETTINGS_STORAGE) },
+                        onOpenGlobalSearch = { viewModel.navigateTo(AppScreen.RECOMMENDATIONS) }
                     )
                 }
 
@@ -427,6 +429,12 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onWorkDetailsUpdated = { updatedWork ->
                             viewModel.updateSelectedWorkDetails(updatedWork)
                         },
+                        onMarkChaptersReadBatch = { work, chNums, markAsRead ->
+                            viewModel.markChaptersReadBatch(work, chNums, markAsRead)
+                        },
+                        onOpenAlternativeSourceChapter = { work, chNum ->
+                            viewModel.openChapterFromAlternativeSite(work, chNum)
+                        },
                         onShowToast = { msg -> viewModel.showToast(msg) }
                     )
                 }
@@ -436,11 +444,15 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         it.title.equals(selectedWork.title, ignoreCase = true) ||
                             it.url.contains(selectedWork.id, ignoreCase = true)
                     }
+                    val savedProgressEntity = readingProgressList.find {
+                        it.workId == selectedWork.id && it.chapterNumber == selectedChapter.number
+                    }
                     val savedPageIndex = readingProgressMap[selectedWork.id]
                         ?.takeIf { it.first == selectedChapter.number }
                         ?.second
                         ?: selectedChapter.lastReadPage.takeIf { it >= 0 }
                         ?: 0
+                    val savedScrollOffset = savedProgressEntity?.scrollOffset ?: 0
                     val liveChapterDownloadState = chapterDownloadStatesMap[selectedWork.id]?.get(selectedChapter.number)
 
                     MangaChapterReaderScreen(
@@ -449,11 +461,18 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         settings = settings,
                         isFavorite = isWorkFav,
                         initialPageIndex = savedPageIndex,
+                        initialScrollOffset = savedScrollOffset,
                         liveChapterDownloadState = liveChapterDownloadState,
                         diagnosticLogs = diagnosticLogs,
                         onClearDiagnosticLogs = { viewModel.clearDiagnosticLogs() },
                         onSaveReadingProgress = { pageIdx ->
                             viewModel.saveReadingProgress(selectedWork, selectedChapter, pageIdx)
+                        },
+                        onSaveReadingProgressWithOffset = { pageIdx, scrollOffset ->
+                            viewModel.saveReadingProgress(selectedWork, selectedChapter, pageIdx, scrollOffset)
+                        },
+                        onOpenAlternativeSourceChapter = {
+                            viewModel.openChapterFromAlternativeSite(selectedWork, selectedChapter.number)
                         },
                         onBackClick = { viewModel.navigateBack() },
                         onSelectChapter = { targetChapter ->
@@ -648,8 +667,17 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                 }
 
                 AppScreen.HISTORY -> {
+                    val totalChaptersReadCount = remember(readChaptersMap) {
+                        readChaptersMap.values.sumOf { it.size }
+                    }
+                    val totalPagesReadCount = remember(readingProgressList) {
+                        readingProgressList.sumOf { (it.lastPageIndex + 1).coerceAtLeast(1) }
+                    }
                     HistoryScreen(
                         historyItems = history,
+                        totalChaptersRead = totalChaptersReadCount,
+                        totalPagesRead = totalPagesReadCount,
+                        readingStreakDays = settings.readingStreakDays,
                         onOpenDrawer = { scope.launch { drawerState.open() } },
                         onOpenHistoryUrl = { title, url ->
                             viewModel.openMangaDetailsFromUrl(title, url)
@@ -728,6 +756,11 @@ fun MangaSitesReaderApp(viewModel: MainViewModel) {
                         onUpdateString = { k, v -> viewModel.setStringSetting(k, v) },
                         onUpdateInt = { k, v -> viewModel.setIntSetting(k, v) },
                         onCleanReadChaptersNow = { viewModel.cleanReadChaptersNow() },
+                        onCompressExistingChaptersWebp = { viewModel.compressAllDownloadedChaptersToWebp() },
+                        onExportFullBackupUri = { uri -> viewModel.exportBackupToUri(uri) },
+                        onImportFullBackupUri = { uri -> viewModel.importBackupFromUri(uri) },
+                        onCreateBackupInternal = { viewModel.createBackup() },
+                        onRestoreBackupInternal = { viewModel.restoreBackup() },
                         onBackClick = { viewModel.navigateBack() },
                         onClearCache = { viewModel.clearAppCache() },
                         onClearSearchHistory = { viewModel.clearPreviousSearchHistory() },

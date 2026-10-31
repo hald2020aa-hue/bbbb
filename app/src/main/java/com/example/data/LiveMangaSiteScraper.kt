@@ -393,19 +393,33 @@ object LiveMangaSiteScraper {
     }
 
     fun isCloudflareChallengeHtml(html: String, httpCode: Int = 200): Boolean {
-        if (httpCode == 403 || httpCode == 503) {
-            if (html.contains("cloudflare", ignoreCase = true) ||
+        if (httpCode == 403 || httpCode == 503 || httpCode == 429) {
+            if (html.isBlank() ||
+                html.contains("cloudflare", ignoreCase = true) ||
                 html.contains("cf-browser-verification", ignoreCase = true) ||
                 html.contains("Just a moment", ignoreCase = true) ||
-                html.contains("challenge-platform", ignoreCase = true)
+                html.contains("challenge-platform", ignoreCase = true) ||
+                html.contains("cf-turnstile", ignoreCase = true) ||
+                html.contains("ddos-guard", ignoreCase = true) ||
+                html.contains("Attention Required", ignoreCase = true) ||
+                html.contains("Verify you are human", ignoreCase = true) ||
+                html.contains("Checking your browser", ignoreCase = true) ||
+                html.contains("sucuri", ignoreCase = true) ||
+                html.contains("captcha", ignoreCase = true)
             ) {
                 return true
             }
         }
-        return html.contains("<title>Just a moment...</title>", ignoreCase = true) ||
+        return html.contains("<title>Just a moment", ignoreCase = true) ||
+            html.contains("<title>Attention Required", ignoreCase = true) ||
+            html.contains("<title>DDOS-GUARD", ignoreCase = true) ||
             html.contains("cf-challenge-running", ignoreCase = true) ||
+            html.contains("challenges.cloudflare.com/turnstile", ignoreCase = true) ||
+            html.contains("/cdn-cgi/challenge-platform/", ignoreCase = true) ||
             html.contains("Enable JavaScript and cookies to continue", ignoreCase = true) ||
-            html.contains("تحقق من أنك إنسان", ignoreCase = true)
+            html.contains("Verify you are human by completing the action", ignoreCase = true) ||
+            html.contains("تحقق من أنك إنسان", ignoreCase = true) ||
+            html.contains("يرجى التحقق من أنك إنسان", ignoreCase = true)
     }
 
     fun resolveUrl(baseUrl: String, rawHref: String): String {
@@ -647,6 +661,8 @@ object LiveMangaSiteScraper {
                     if (domRes.works.isNotEmpty()) {
                         works = domRes.works
                         hitCloudflare = false
+                    } else if (domRes.requiresCloudflare) {
+                        hitCloudflare = true
                     }
                 }
             }
@@ -999,19 +1015,42 @@ object LiveMangaSiteScraper {
                     if (domRes.work.chapters.isNotEmpty() || domRes.work.description.isNotBlank()) {
                         parsedWork = domRes.work
                         hitCloudflare = false
+                    } else if (domRes.requiresCloudflare) {
+                        hitCloudflare = true
                     }
                 }
             }
 
-            // If still empty or only summary endpoints were found, check if we can infer chapters from initial HTML metadata/endpoints
-            if (parsedWork.chapters.isEmpty() && initialHtml.isNotBlank()) {
-                val inferred = inferChaptersFromPageMetadataOrEndpoints(initialHtml, parsedWork.id, targetUrl)
-                if (inferred.isNotEmpty()) {
+            // If still empty, check if the page itself is a single-chapter work / gallery with pages on the work page
+            if (parsedWork.chapters.isEmpty() && initialHtml.isNotBlank() && !hitCloudflare) {
+                val singleGalleryPages = extractSingleChapterGalleryPages(initialHtml, targetUrl)
+                if (singleGalleryPages.isNotEmpty()) {
+                    cacheChapterPages(targetUrl, singleGalleryPages)
+                    val singleCh = MangaChapter(
+                        id = "${parsedWork.id}_ch_1",
+                        number = 1,
+                        title = "الفصل 1",
+                        dateText = "",
+                        chapterUrl = targetUrl,
+                        pageImageUrls = singleGalleryPages,
+                        pageCount = singleGalleryPages.size,
+                        chapterNumberValue = 1.0,
+                        numberLabel = "1"
+                    )
                     parsedWork = parsedWork.copy(
-                        chapters = inferred,
-                        chaptersCount = inferred.size,
+                        chapters = listOf(singleCh),
+                        chaptersCount = 1,
                         isDetailsLoaded = true
                     )
+                } else {
+                    val inferred = inferChaptersFromPageMetadataOrEndpoints(initialHtml, parsedWork.id, targetUrl)
+                    if (inferred.isNotEmpty()) {
+                        parsedWork = parsedWork.copy(
+                            chapters = inferred,
+                            chaptersCount = inferred.size,
+                            isDetailsLoaded = true
+                        )
+                    }
                 }
             }
 
@@ -1149,7 +1188,29 @@ object LiveMangaSiteScraper {
         }
 
         // Chapters extraction
-        val chapters = parseChaptersFromHtmlFragment(html, baseWork.id, pageUrl)
+        var chapters = parseChaptersFromHtmlFragment(html, baseWork.id, pageUrl)
+
+        // If 0 multi-chapter links were found, check if this work is a Single-Chapter / One-Shot / Gallery work
+        // where the work page itself contains the page thumbnails or reader images (preventing 12 pages from becoming 12 chapters!)
+        if (chapters.isEmpty()) {
+            val singleGalleryPages = extractSingleChapterGalleryPages(html, pageUrl)
+            if (singleGalleryPages.isNotEmpty()) {
+                cacheChapterPages(pageUrl, singleGalleryPages)
+                chapters = listOf(
+                    MangaChapter(
+                        id = "${baseWork.id}_ch_1",
+                        number = 1,
+                        title = "الفصل 1",
+                        dateText = "",
+                        chapterUrl = pageUrl,
+                        pageImageUrls = singleGalleryPages,
+                        pageCount = singleGalleryPages.size,
+                        chapterNumberValue = 1.0,
+                        numberLabel = "1"
+                    )
+                )
+            }
+        }
 
         return baseWork.copy(
             title = h1Title ?: ogTitle ?: baseWork.title,
@@ -1183,13 +1244,13 @@ object LiveMangaSiteScraper {
         val summaryButtonChapters = mutableListOf<MangaChapter>()
         val seenUrlKeys = HashSet<String>()
 
-        // Strategy 0: Extract chapters from <select><option> dropdowns or embedded JSON in <script> before stripping scripts
+        // Strategy 0: Strip scripts, styles, related manga sections, AND page thumbnail / gallery / pagination containers
+        // so page thumbnails (e.g. /g/12345/1/ .. /g/12345/12/) are NEVER mistaken for separate chapters!
         val cleanHtml = html
             .replace(Regex("<script[^>]*>[\\s\\S]*?</script>", RegexOption.IGNORE_CASE), "")
             .replace(Regex("<style[^>]*>[\\s\\S]*?</style>", RegexOption.IGNORE_CASE), "")
-            // Remove related/recommended manga sections at the bottom/sidebar so their links don't pollute the work's chapters
             .replace(
-                Regex("""<(?:div|section|aside)[^>]+class=["'][^"']*(?:related-manga|related-series|c-blog__heading|widget-manga-recent|popular-slider|hot-series)[^"']*["'][^>]*>[\s\S]{10,15000}?</(?:div|section|aside)>""", RegexOption.IGNORE_CASE),
+                Regex("""<(?:div|section|aside|ul|nav)[^>]+(?:id|class)=["'][^"']*(?:related-manga|related-series|c-blog__heading|widget-manga-recent|popular-slider|hot-series|thumbnail-container|thumb-container|gallerythumb|gallery-thumbs|page-thumbnails|preview-grid|gdtl|gtb|wp-pagenavi|pagination|nav-links|page-numbers)[^"']*["'][^>]*>[\s\S]{5,25000}?</(?:div|section|aside|ul|nav)>""", RegexOption.IGNORE_CASE),
                 ""
             )
 
@@ -1201,6 +1262,13 @@ object LiveMangaSiteScraper {
         liTrRegex.findAll(cleanHtml).forEach { match ->
             val attrs = match.groupValues[2]
             val innerBlock = match.groupValues[3]
+            if (attrs.contains("page-item", ignoreCase = true) ||
+                attrs.contains("page-numbers", ignoreCase = true) ||
+                attrs.contains("thumb", ignoreCase = true) ||
+                attrs.contains("gallery", ignoreCase = true)
+            ) {
+                return@forEach
+            }
             val hasExplicitChapterMarker = isInsideChapterContainer ||
                 attrs.contains("wp-manga-chapter", ignoreCase = true) ||
                 attrs.contains("chapter", ignoreCase = true) ||
@@ -1266,7 +1334,8 @@ object LiveMangaSiteScraper {
             }
         }
 
-        // Strategy 2: Universal Anchor Scan across the ENTIRE cleanHtml (never truncated by container </div>!)
+        // Strategy 2: Universal Anchor Scan across cleanHtml (only if structured chapter containers didn't already find all chapters,
+        // and strictly excluding page thumbnail links <a><img...></a> and pagination links!)
         val anchorRegex = Regex("""<a(\b[^>]*href=["']([^"']+)["'][^>]*)>([\s\S]{1,1500}?)</a>""", RegexOption.IGNORE_CASE)
         anchorRegex.findAll(cleanHtml).forEach { match ->
             val aAttrs = match.groupValues[1]
@@ -1275,7 +1344,12 @@ object LiveMangaSiteScraper {
             if (rawHref.isBlank() || rawHref.startsWith("#") || rawHref.startsWith("javascript:", ignoreCase = true)) {
                 return@forEach
             }
-            if (aAttrs.contains("bookmark", ignoreCase = true)) {
+            if (aAttrs.contains("bookmark", ignoreCase = true) ||
+                aAttrs.contains("page-numbers", ignoreCase = true) ||
+                aAttrs.contains("page-link", ignoreCase = true) ||
+                aAttrs.contains("gallerythumb", ignoreCase = true) ||
+                aAttrs.contains("thumb", ignoreCase = true)
+            ) {
                 return@forEach
             }
 
@@ -1284,6 +1358,38 @@ object LiveMangaSiteScraper {
             if (chUrl.isBlank() || urlKey.isBlank() || seenUrlKeys.contains(urlKey)) return@forEach
 
             val strippedText = stripHtmlTags(innerHtml).trim()
+            val hasChapterChildClasses = innerHtml.contains("chapternum", ignoreCase = true) ||
+                innerHtml.contains("chapter-title", ignoreCase = true) ||
+                innerHtml.contains("chapter-number", ignoreCase = true) ||
+                innerHtml.contains("ch-num", ignoreCase = true) ||
+                innerHtml.contains("eph-num", ignoreCase = true) ||
+                innerHtml.contains("chbox", ignoreCase = true) ||
+                innerHtml.contains("epxs", ignoreCase = true)
+            val hasExplicitChapterWord = strippedText.contains("فصل") ||
+                strippedText.contains("الفصل") ||
+                strippedText.contains("الحلقة") ||
+                strippedText.contains("Chapter", ignoreCase = true) ||
+                strippedText.contains("Ch.", ignoreCase = true) ||
+                strippedText.contains("Ep.", ignoreCase = true)
+
+            // CRITICAL FIX: If an <a> wraps an <img> (like a gallery page thumbnail <a href="/g/123/1/"><img src="1t.jpg"></a>)
+            // and has NO explicit chapter text or chapter child classes, it is a PAGE THUMBNAIL or COVER, NEVER a chapter!
+            val wrapsImageThumbnail = innerHtml.contains("<img", ignoreCase = true) ||
+                innerHtml.contains("background-image", ignoreCase = true)
+            if (wrapsImageThumbnail && !hasChapterChildClasses && !hasExplicitChapterWord) {
+                return@forEach
+            }
+
+            // Also check surrounding 250 chars to ensure this anchor is not inside a thumbnail or pagination block
+            val contextStart = (match.range.first - 250).coerceAtLeast(0)
+            val contextEnd = (match.range.last + 250).coerceAtMost(cleanHtml.length)
+            val surroundingHtml = cleanHtml.substring(contextStart, contextEnd)
+            if (!hasChapterChildClasses && !hasExplicitChapterWord &&
+                Regex("""(?:thumbnail-container|gallerythumb|thumb-container|page-numbers|wp-pagenavi|pagination|gdtl)""", RegexOption.IGNORE_CASE).containsMatchIn(surroundingHtml)
+            ) {
+                return@forEach
+            }
+
             val isSummaryBtn = aAttrs.contains("first-chapter", ignoreCase = true) ||
                 aAttrs.contains("last-chapter", ignoreCase = true) ||
                 strippedText.equals("أول فصل", ignoreCase = true) ||
@@ -1298,32 +1404,17 @@ object LiveMangaSiteScraper {
                 strippedText.equals("Read Last", ignoreCase = true)
 
             val looksLikeChapterUrl = isLikelyChapterUrl(chUrl, pageUrl)
-            val hasChapterChildClasses = innerHtml.contains("chapternum", ignoreCase = true) ||
-                innerHtml.contains("chapter-title", ignoreCase = true) ||
-                innerHtml.contains("chapter-number", ignoreCase = true) ||
-                innerHtml.contains("ch-num", ignoreCase = true) ||
-                innerHtml.contains("eph-num", ignoreCase = true) ||
-                innerHtml.contains("chbox", ignoreCase = true) ||
-                innerHtml.contains("epxs", ignoreCase = true)
-            val looksLikeChapterText = strippedText.contains("فصل") ||
-                strippedText.contains("الفصل") ||
-                strippedText.contains("Chapter", ignoreCase = true) ||
-                strippedText.contains("Ch.", ignoreCase = true) ||
-                Regex("""^(?:ch|ep|#)?\s*\d+(?:\.\d+)?$""", RegexOption.IGNORE_CASE).matches(strippedText)
+            val looksLikeChapterText = hasExplicitChapterWord ||
+                (isInsideChapterContainer && Regex("""^(?:ch|ep|#)?\s*\d+(?:\.\d+)?$""", RegexOption.IGNORE_CASE).matches(strippedText))
 
             if (looksLikeChapterUrl || hasChapterChildClasses || (looksLikeChapterText && (isInsideChapterContainer || isSameWorkContext(chUrl, pageUrl)))) {
-                // Include surrounding context (up to 250 chars before and after <a>) to capture sibling date or data-num attributes
-                val contextStart = (match.range.first - 250).coerceAtLeast(0)
-                val contextEnd = (match.range.last + 250).coerceAtMost(cleanHtml.length)
-                val surroundingHtml = cleanHtml.substring(contextStart, contextEnd)
-
                 val parsed = parseSingleChapterBlock(
                     fullBlockHtml = surroundingHtml,
                     innerBlockHtml = match.value,
                     workId = workId,
                     pageUrl = pageUrl,
                     fallbackOrder = (rawChapters.size + summaryButtonChapters.size) + 1,
-                    trustContainerContext = isInsideChapterContainer || hasChapterChildClasses || looksLikeChapterUrl
+                    trustContainerContext = isInsideChapterContainer || hasChapterChildClasses
                 )
                 if (parsed != null) {
                     if (isSummaryBtn) {
@@ -1455,8 +1546,14 @@ object LiveMangaSiteScraper {
         workId: String,
         pageUrl: String
     ): List<MangaChapter> {
-        // Look for explicit chapter count in Arabic/English metadata on the page if URL follows standard /series/slug or /manga/slug
-        val countMatch = Regex("""(?:عدد الفصول|الفصول|Chapters)\s*[:：]?\s*(\d{1,3})\b""", RegexOption.IGNORE_CASE)
+        if (isGalleryOrSingleWorkUrl(pageUrl)) return emptyList()
+        val lowerUrl = pageUrl.lowercase(Locale.ROOT)
+        if (!lowerUrl.contains("/series/") && !lowerUrl.contains("/manga/")) return emptyList()
+        // Only infer if there are NO gallery thumbnails on the page
+        if (html.contains("thumbnail-container", ignoreCase = true) || html.contains("gallerythumb", ignoreCase = true)) {
+            return emptyList()
+        }
+        val countMatch = Regex("""(?:عدد الفصول)\s*[:：]?\s*(\d{1,3})\b""", RegexOption.IGNORE_CASE)
             .find(stripHtmlTags(html))
             ?.groupValues?.getOrNull(1)?.toIntOrNull()
         if (countMatch != null && countMatch in 1..400) {
@@ -1499,12 +1596,29 @@ object LiveMangaSiteScraper {
 
         val aAttrs = aMatch.groupValues[1]
         val rawHref = aMatch.groupValues[2].trim()
+        val anchorInnerHtml = aMatch.groupValues[3]
         if (rawHref.isBlank() || rawHref.startsWith("#") || rawHref.startsWith("javascript:", ignoreCase = true)) return null
         val chUrl = resolveUrl(pageUrl, rawHref)
         if (chUrl.isBlank()) return null
 
         // Reject if it points to the manga page itself or an obvious non-chapter page
         if (isRejectedNonChapterUrl(chUrl, pageUrl)) return null
+
+        // Reject gallery page thumbnail links (<a href="/g/123/1/"><img src="1t.jpg"></a>) that have no chapter text or chapter classes
+        val strippedAnchorText = stripHtmlTags(anchorInnerHtml).trim()
+        val hasExplicitChapterWordInAnchor = strippedAnchorText.contains("فصل") ||
+            strippedAnchorText.contains("الفصل") ||
+            strippedAnchorText.contains("الحلقة") ||
+            strippedAnchorText.contains("Chapter", ignoreCase = true) ||
+            strippedAnchorText.contains("Ch.", ignoreCase = true) ||
+            anchorInnerHtml.contains("chapternum", ignoreCase = true) ||
+            anchorInnerHtml.contains("chapter-title", ignoreCase = true) ||
+            anchorInnerHtml.contains("ch-num", ignoreCase = true) ||
+            anchorInnerHtml.contains("epxs", ignoreCase = true)
+        if (!trustContainerContext && anchorInnerHtml.contains("<img", ignoreCase = true) && !hasExplicitChapterWordInAnchor) {
+            return null
+        }
+
         if (!trustContainerContext && !isLikelyChapterUrl(chUrl, pageUrl)) return null
 
         // 1. Extract structural data-num / data-chapter if present on <li>, <div>, or <a>
@@ -1935,6 +2049,8 @@ object LiveMangaSiteScraper {
                         pages = domResult.pageUrls.toMutableList()
                         allDiagnostics.addAll(domResult.diagnostics)
                         hitCloudflare = false
+                    } else if (domResult.requiresCloudflare) {
+                        hitCloudflare = true
                     }
                 }
             }
@@ -2203,10 +2319,91 @@ object LiveMangaSiteScraper {
             }
         }
 
+        // 6. Single-Chapter Gallery / Doujinshi Fallback: if the chapter URL is a gallery page with page thumbnails,
+        // convert all thumbnail URLs into full-resolution page URLs so all pages appear inside this single chapter!
+        if (images.isEmpty()) {
+            val galleryPages = extractSingleChapterGalleryPages(html, chapterUrl)
+            galleryPages.forEach { gUrl ->
+                images.add(gUrl)
+                diagnostics.add(
+                    PageCandidateDiagnostic(
+                        rawUrl = gUrl,
+                        resolvedUrl = gUrl,
+                        sourceElement = "gallery-single-chapter",
+                        attributeUsed = "thumb-to-full",
+                        accepted = true,
+                        reason = "صفحة فصل مستخرجة من معرض الفصل الواحد"
+                    )
+                )
+            }
+        }
+
         return ChapterPagesScrapeResult(
             pageUrls = images.toList(),
             diagnostics = diagnostics
         )
+    }
+
+    internal fun isGalleryOrSingleWorkUrl(url: String): Boolean {
+        val lower = decodeUrlSafe(url).lowercase(Locale.ROOT)
+        return Regex("""/(?:g|gallery|galleries|d|doujin|doujinshi|hentai|oneshot)/[^/?#]+""").containsMatchIn(lower)
+    }
+
+    internal fun convertGalleryThumbnailToFullImageUrl(thumbUrl: String): String {
+        if (thumbUrl.isBlank()) return ""
+        var full = thumbUrl.trim()
+        // Convert nhentai / imhentai / 3hentai style thumbnail hosts and filenames:
+        // e.g. https://t3.nhentai.net/galleries/12345/1t.jpg -> https://i3.nhentai.net/galleries/12345/1.jpg
+        // e.g. .../1t.webp -> .../1.webp, .../1t.png -> .../1.png, .../1_thumb.jpg -> .../1.jpg
+        full = full.replace(Regex("""^(https?://)t(\d*)\."""), "$1i$2.")
+        full = full.replace(Regex("""/(\d+)t\.(jpg|jpeg|png|webp|avif)(\?.*)?$""", RegexOption.IGNORE_CASE), "/$1.$2$3")
+        full = full.replace(Regex("""/(\d+)_thumb\.(jpg|jpeg|png|webp|avif)(\?.*)?$""", RegexOption.IGNORE_CASE), "/$1.$2$3")
+        full = full.replace("/thumbs/", "/images/")
+        full = full.replace("/thumb/", "/image/")
+        return full
+    }
+
+    internal fun extractSingleChapterGalleryPages(html: String, pageUrl: String): List<String> {
+        if (html.isBlank()) return emptyList()
+        val pages = LinkedHashSet<String>()
+        val cleanBase = pageUrl.substringBefore("?").substringBefore("#").trimEnd('/')
+
+        // 1. Check dedicated gallery thumbnail containers (#thumbnail-container, .gallerythumb, .thumb-container, .gdt, .preview-grid)
+        val galleryContainerRegex = Regex(
+            """<(?:div|section|ul)[^>]+(?:id|class)=["'][^"']*(?:thumbnail-container|thumb-container|gallerythumb|gallery-thumbs|gdt|preview-grid|page-thumbnails)[^"']*["'][^>]*>([\s\S]{20,250000}?)</(?:div|section|ul)>""",
+            RegexOption.IGNORE_CASE
+        )
+        galleryContainerRegex.findAll(html).forEach { m ->
+            Regex("""<img\b[^>]+>""", RegexOption.IGNORE_CASE).findAll(m.groupValues[1]).forEach { imgMatch ->
+                val rawImg = extractBestImageUrl(imgMatch.value, pageUrl)
+                if (rawImg.isNotBlank() && !isIgnoredAssetImage(rawImg)) {
+                    pages.add(convertGalleryThumbnailToFullImageUrl(rawImg))
+                }
+            }
+        }
+        if (pages.isNotEmpty()) return pages.toList()
+
+        // 2. Check numbered page thumbnail anchors: <a href=".../1/"><img src="...1t.jpg"></a>
+        val numberedThumbAnchorRegex = Regex(
+            """<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{5,1200}?)</a>""",
+            RegexOption.IGNORE_CASE
+        )
+        numberedThumbAnchorRegex.findAll(html).forEach { m ->
+            val href = resolveUrl(pageUrl, m.groupValues[1].trim())
+            val inner = m.groupValues[2]
+            if (!inner.contains("<img", ignoreCase = true)) return@forEach
+            val cleanHref = href.substringBefore("?").substringBefore("#").trimEnd('/')
+            if (cleanHref.startsWith("$cleanBase/", ignoreCase = true)) {
+                val sub = cleanHref.substring(cleanBase.length + 1)
+                if (Regex("""^\d{1,4}$""").matches(sub)) {
+                    val rawImg = extractBestImageUrl(inner, pageUrl)
+                    if (rawImg.isNotBlank() && !isIgnoredAssetImage(rawImg)) {
+                        pages.add(convertGalleryThumbnailToFullImageUrl(rawImg))
+                    }
+                }
+            }
+        }
+        return pages.toList()
     }
 
     internal fun isVerifiedDirectImageUrl(url: String): Boolean {
@@ -2466,6 +2663,8 @@ object LiveMangaSiteScraper {
                     if (domUpdates.updates.isNotEmpty()) {
                         updates = domUpdates.updates
                         hitCloudflare = false
+                    } else if (domUpdates.requiresCloudflare) {
+                        hitCloudflare = true
                     }
                 }
             }
@@ -2920,14 +3119,20 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_CATALOG = """
         (function() {
             var title = document.title || "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : "";
             var isCf = title.indexOf("Just a moment") !== -1 ||
-                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, iframe[src*='challenges.cloudflare.com']");
+                       title.indexOf("Attention Required") !== -1 ||
+                       title.indexOf("DDOS-GUARD") !== -1 ||
+                       bodyTxt.indexOf("Verify you are human") !== -1 ||
+                       bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                       bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
+                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage");
             var items = [];
             var seen = {};
             var selectors = [
                 ".page-item-detail", ".c-tabs-item__content", ".bs .bsx", ".bs", ".listupd .utao",
                 ".box", ".manga__item", ".series-card", ".animepost", "article", ".item", ".post-item",
-                ".manga-card", ".serie-card", ".grid-item", ".card"
+                ".manga-card", ".serie-card", ".grid-item", ".card", ".gallery"
             ];
             var cards = document.querySelectorAll(selectors.join(","));
             function getImgUrl(el) {
@@ -2953,7 +3158,7 @@ object LiveMangaSiteScraper {
                 if (seen[href]) continue;
                 var imgUrl = getImgUrl(c);
                 if (!imgUrl) continue;
-                var heading = c.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name");
+                var heading = c.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name, .caption");
                 var t = (heading ? heading.innerText : (a.getAttribute("title") || a.innerText || "")).trim();
                 if (!t) {
                     var im = c.querySelector("img[alt]");
@@ -2979,14 +3184,20 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_LATEST_UPDATES = """
         (function() {
             var title = document.title || "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : "";
             var isCf = title.indexOf("Just a moment") !== -1 ||
-                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, iframe[src*='challenges.cloudflare.com']");
+                       title.indexOf("Attention Required") !== -1 ||
+                       title.indexOf("DDOS-GUARD") !== -1 ||
+                       bodyTxt.indexOf("Verify you are human") !== -1 ||
+                       bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                       bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
+                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage");
             var updates = [];
             var seen = {};
             var selectors = [
                 ".page-item-detail", ".c-tabs-item__content", ".utao", ".bsx", ".bs",
                 ".manga__item", ".post-item", ".series-card", ".animepost", ".latest-item",
-                ".update-item", ".box", ".manga-card", ".serie-card", "article", ".card"
+                ".update-item", ".box", ".manga-card", ".serie-card", "article", ".card", ".gallery"
             ];
             var cards = document.querySelectorAll(selectors.join(","));
             for (var i = 0; i < cards.length; i++) {
@@ -2998,7 +3209,7 @@ object LiveMangaSiteScraper {
                 var img = c.querySelector("img");
                 var cover = img ? (img.getAttribute("data-src") || img.getAttribute("data-lazy-src") || img.currentSrc || img.src || "") : "";
                 if (!cover) continue;
-                var heading = c.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name");
+                var heading = c.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name, .caption");
                 var wTitle = (heading ? heading.innerText : (a.getAttribute("title") || "")).trim();
                 if (!wTitle && img) wTitle = (img.getAttribute("alt") || "").trim();
                 if (!wTitle || wTitle.length < 2) continue;
@@ -3024,17 +3235,23 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_DETAILS = """
         (function() {
             var title = document.title || "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : "";
             var isCf = title.indexOf("Just a moment") !== -1 ||
-                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, iframe[src*='challenges.cloudflare.com']");
+                       title.indexOf("Attention Required") !== -1 ||
+                       title.indexOf("DDOS-GUARD") !== -1 ||
+                       bodyTxt.indexOf("Verify you are human") !== -1 ||
+                       bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                       bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
+                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage");
             try {
                 var moreBtns = document.querySelectorAll(".chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters");
                 for (var m = 0; m < moreBtns.length; m++) {
                     if (moreBtns[m] && typeof moreBtns[m].click === "function") moreBtns[m].click();
                 }
             } catch (e) {}
-            var h1 = document.querySelector(".post-title h1, h1.entry-title, .series-title h1, .manga-title h1, .post-title h2, main h1, article h1") || document.querySelector("h1");
+            var h1 = document.querySelector(".post-title h1, h1.entry-title, .series-title h1, .manga-title h1, .post-title h2, #info h1, #info h2, main h1, article h1") || document.querySelector("h1");
             var workTitle = h1 ? h1.innerText.trim() : title;
-            var coverEl = document.querySelector(".summary_image img, .thumb img, .white-bg img, .series-thumb img, .poster img, meta[property='og:image']");
+            var coverEl = document.querySelector(".summary_image img, .thumb img, #cover img, .white-bg img, .series-thumb img, .poster img, meta[property='og:image']");
             var cover = "";
             if (coverEl) {
                 cover = coverEl.getAttribute("content") || coverEl.getAttribute("data-src") || coverEl.getAttribute("data-lazy-src") || coverEl.currentSrc || coverEl.src || "";
@@ -3042,7 +3259,7 @@ object LiveMangaSiteScraper {
             var descEl = document.querySelector(".summary__content, .description-summary, .review-content, .entry-content-single, .story, .desc, .synopsis");
             var desc = descEl ? descEl.innerText.trim() : "";
             var genres = [];
-            var gLinks = document.querySelectorAll(".genres-content a, .mgen a, .wp-manga-tags-list a, .genre-info a, .review-author-info a, a[href*='genre']");
+            var gLinks = document.querySelectorAll(".genres-content a, .mgen a, .wp-manga-tags-list a, .genre-info a, .review-author-info a, .tags a, a[href*='genre'], a[href*='tag']");
             for (var i = 0; i < gLinks.length; i++) {
                 var gt = gLinks[i].innerText.trim();
                 if (gt && gt.length >= 2 && gt.length <= 24 && genres.indexOf(gt) === -1) {
@@ -3062,26 +3279,35 @@ object LiveMangaSiteScraper {
             ];
             var chNodes = document.querySelectorAll(chSelectors.join(","));
             var baseHref = (window.location.href || "").split("?")[0].split("#")[0].replace(/\/+$/, "").toLowerCase();
-            if (chNodes.length === 0) {
+            var isGalleryPath = /\/(?:g|gallery|galleries|d|doujin|doujinshi|hentai|oneshot)\//i.test(baseHref);
+            if (chNodes.length === 0 && !isGalleryPath) {
                 var allLinks = document.querySelectorAll("a[href]");
                 var filtered = [];
                 for (var f = 0; f < allLinks.length; f++) {
                     var link = allLinks[f];
-                    if (link.closest && link.closest("nav, header, footer, .related-manga, .widget-manga-recent")) continue;
+                    if (link.closest && link.closest("nav, header, footer, .related-manga, .widget-manga-recent, #thumbnail-container, .thumbnail-container, .thumb-container, .gallerythumb, .gallery-thumbs, .thumbs, .gdt, .gdtl, .pagination, .page-numbers, .wp-pagenavi, .nav-links")) continue;
+                    var hasExplicitChSpan = link.querySelector && link.querySelector(".chapternum, .chapter-title, .chapter-number, .ch-num, .epxs");
+                    var lTxt = (link.innerText || "").trim();
+                    var hasChWordInText = lTxt.indexOf("فصل") !== -1 ||
+                                          lTxt.indexOf("الفصل") !== -1 ||
+                                          lTxt.indexOf("الحلقة") !== -1 ||
+                                          lTxt.toLowerCase().indexOf("chapter") !== -1 ||
+                                          lTxt.toLowerCase().indexOf("ch.") !== -1;
+                    // CRITICAL: Never treat an <a> wrapping an <img> (like a page thumbnail) as a chapter unless it explicitly has chapter text/spans!
+                    if (link.querySelector && link.querySelector("img") && !hasExplicitChSpan && !hasChWordInText) continue;
                     var rawH = link.href || "";
                     var decH = rawH;
                     try { decH = decodeURIComponent(rawH); } catch (e) {}
                     var lowH = decH.toLowerCase().split("?")[0].split("#")[0].replace(/\/+$/, "");
-                    var lTxt = (link.innerText || "").trim();
                     if (!lowH || lowH === baseHref || lowH.indexOf("javascript:") === 0) continue;
-                    if (lowH.indexOf("/genre/") !== -1 || lowH.indexOf("/tag/") !== -1 || lowH.indexOf("/author/") !== -1 || lowH.indexOf("/login") !== -1) continue;
-                    if ((baseHref && lowH.indexOf(baseHref + "/") === 0) ||
+                    if (lowH.indexOf("/genre/") !== -1 || lowH.indexOf("/tag/") !== -1 || lowH.indexOf("/author/") !== -1 || lowH.indexOf("/login") !== -1 || lowH.indexOf("/page/") !== -1 || lowH.indexOf("?page=") !== -1) continue;
+                    var isSubUrlOfSeries = baseHref && lowH.indexOf(baseHref + "/") === 0 && (baseHref.indexOf("/manga/") !== -1 || baseHref.indexOf("/series/") !== -1 || baseHref.indexOf("/manhwa/") !== -1) && lTxt.length > 0;
+                    if (isSubUrlOfSeries ||
                         lowH.indexOf("chapter") !== -1 ||
                         lowH.indexOf("فصل") !== -1 ||
                         lowH.indexOf("الفصل") !== -1 ||
-                        lTxt.indexOf("فصل") !== -1 ||
-                        lTxt.indexOf("الفصل") !== -1 ||
-                        lTxt.toLowerCase().indexOf("chapter") !== -1) {
+                        hasChWordInText ||
+                        hasExplicitChSpan) {
                         filtered.push(link);
                     }
                 }
@@ -3111,13 +3337,27 @@ object LiveMangaSiteScraper {
                 seenCh[href] = true;
                 chapters.push({ title: txt, url: href, date: dateTxt, num: dataNum });
             }
+            var galleryPages = [];
+            if (chapters.length === 0) {
+                var thumbImgs = document.querySelectorAll("#thumbnail-container img, .thumbnail-container img, .thumb-container img, .gallerythumb img, .gallery-thumbs img, .gdt img, .preview-grid img, .reading-content img, #readerarea img");
+                var seenG = {};
+                for (var gi = 0; gi < thumbImgs.length; gi++) {
+                    var gim = thumbImgs[gi];
+                    var gsrc = gim.getAttribute("data-src") || gim.getAttribute("data-lazy-src") || gim.getAttribute("data-original") || gim.currentSrc || gim.src || "";
+                    if (gsrc && gsrc.indexOf("data:image") === -1 && !seenG[gsrc]) {
+                        seenG[gsrc] = true;
+                        galleryPages.push(gsrc);
+                    }
+                }
+            }
             return JSON.stringify({
                 cf: isCf,
                 title: workTitle,
                 cover: cover,
                 desc: desc,
                 genres: genres.slice(0, 8),
-                chapters: chapters.slice(0, 1500)
+                chapters: chapters.slice(0, 1500),
+                galleryPages: galleryPages.slice(0, 500)
             });
         })();
     """.trimIndent()
@@ -3125,8 +3365,14 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_CHAPTER_PAGES = """
         (function() {
             var title = document.title || "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1200) : "";
             var isCf = title.indexOf("Just a moment") !== -1 ||
-                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, iframe[src*='challenges.cloudflare.com']");
+                       title.indexOf("Attention Required") !== -1 ||
+                       title.indexOf("DDOS-GUARD") !== -1 ||
+                       bodyTxt.indexOf("Verify you are human") !== -1 ||
+                       bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                       bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
+                       !!document.querySelector("#cf-wrapper, .cf-browser-verification, .cf-turnstile, iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage");
             var urls = [];
             var seen = {};
             function isInvalidImg(u, el) {
@@ -3194,6 +3440,8 @@ object LiveMangaSiteScraper {
                 ".chapter-reader img", ".chapter-images img", ".chapter-imgs img",
                 ".reader-content img", ".manga-reader img", ".page-list img",
                 ".ch-images img", ".read-container img", ".images-container img",
+                "#thumbnail-container img", ".thumbnail-container img", ".gallerythumb img",
+                ".gallery-thumbs img", ".gdt img", ".preview-grid img",
                 ".entry-content img", "main img", "article img"
             ];
             var readerImgs = document.querySelectorAll(readerSelectors.join(","));
@@ -3392,7 +3640,36 @@ object LiveMangaSiteScraper {
                 }
             }
 
-            val sortedChapters = deduplicateAndSortChapters(chList, baseWork.id)
+            var sortedChapters = deduplicateAndSortChapters(chList, baseWork.id)
+            if (sortedChapters.isEmpty()) {
+                val gArr = obj.optJSONArray("galleryPages")
+                if (gArr != null && gArr.length() > 0) {
+                    val galleryUrls = LinkedHashSet<String>()
+                    for (gi in 0 until gArr.length()) {
+                        val rawG = resolveUrl(baseWork.siteUrl, gArr.optString(gi))
+                        if (rawG.isNotBlank() && !isIgnoredAssetImage(rawG)) {
+                            galleryUrls.add(convertGalleryThumbnailToFullImageUrl(rawG))
+                        }
+                    }
+                    if (galleryUrls.isNotEmpty()) {
+                        val targetWorkUrl = baseWork.mangaUrl.ifBlank { baseWork.siteUrl }
+                        cacheChapterPages(targetWorkUrl, galleryUrls.toList())
+                        sortedChapters = listOf(
+                            MangaChapter(
+                                id = "${baseWork.id}_ch_1",
+                                number = 1,
+                                title = "الفصل 1",
+                                dateText = "",
+                                chapterUrl = targetWorkUrl,
+                                pageImageUrls = galleryUrls.toList(),
+                                pageCount = galleryUrls.size,
+                                chapterNumberValue = 1.0,
+                                numberLabel = "1"
+                            )
+                        )
+                    }
+                }
+            }
             val updated = baseWork.copy(
                 title = title,
                 status = normalizeStatusArabic(baseWork.status),
@@ -3421,7 +3698,8 @@ object LiveMangaSiteScraper {
             val urls = LinkedHashSet<String>()
             val diagnostics = mutableListOf<PageCandidateDiagnostic>()
             for (i in 0 until pArr.length()) {
-                val u = resolveUrl(chapterUrl, pArr.optString(i))
+                val rawResolved = resolveUrl(chapterUrl, pArr.optString(i))
+                val u = convertGalleryThumbnailToFullImageUrl(rawResolved)
                 val rejection = getCandidateRejectionReason(u, tagHtml = "<dom-bridge>", isInsideReaderContainer = true)
                 if (rejection == null) {
                     urls.add(u)
@@ -3686,11 +3964,32 @@ object LiveMangaSiteScraper {
         val lower = decodeUrlSafe(url).lowercase(Locale.ROOT)
         val basePage = decodeUrlSafe(mangaPageUrl).substringBefore("?").substringBefore("#").trimEnd('/').lowercase(Locale.ROOT)
 
+        // If the parent work is a single-work gallery (/g/12345/, /gallery/12345/, /doujinshi/12345/),
+        // numeric sub-URLs like /g/12345/1/, /g/12345/2/ are PAGES of that single chapter, NOT separate chapters!
+        if (isGalleryOrSingleWorkUrl(basePage)) {
+            return lower.contains("chapter") || lower.contains("فصل") || lower.contains("الفصل")
+        }
+
         // Compare normalized scheme/www-agnostic base URL prefix
         val normUrl = normalizeChapterUrlKey(lower)
         val normBase = normalizeChapterUrlKey(basePage)
         if (normBase.isNotBlank() && normUrl.startsWith("$normBase/") && normUrl.length > normBase.length + 1) {
-            return true
+            val subPath = normUrl.removePrefix("$normBase/").trim('/')
+            val isExplicitChapterSub = subPath.contains("chapter") ||
+                subPath.contains("ch") ||
+                subPath.contains("ep") ||
+                subPath.contains("فصل") ||
+                subPath.contains("الفصل") ||
+                subPath.contains("read")
+            val isSeriesParent = normBase.contains("/manga/") ||
+                normBase.contains("/series/") ||
+                normBase.contains("/manhwa/") ||
+                normBase.contains("/comic/") ||
+                normBase.contains("/work/") ||
+                normBase.contains("/novel/")
+            if (isExplicitChapterSub || (isSeriesParent && Regex("""^\d+(?:[._-]\d+)?$""").matches(subPath))) {
+                return true
+            }
         }
 
         val workSlug = slugFromUrl(basePage)

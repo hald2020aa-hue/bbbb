@@ -1075,6 +1075,78 @@ class AppRepository(
         restoredCount
     }
 
+    suspend fun exportBackupJsonToUri(uri: Uri): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val backupPath = exportBackupJson()
+            val backupFile = File(backupPath)
+            if (!backupFile.exists()) return@withContext false
+            context.contentResolver.openOutputStream(uri)?.use { out ->
+                backupFile.inputStream().use { it.copyTo(out) }
+            }
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    suspend fun restoreBackupFromUri(uri: Uri): Int = withContext(Dispatchers.IO) {
+        try {
+            val content = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                ?: return@withContext 0
+            val backupFile = File(getSavedDirectory(), "backup_manga_reader.json")
+            backupFile.writeText(content, Charsets.UTF_8)
+            restoreBackupFromDefaultFile()
+        } catch (_: Throwable) {
+            0
+        }
+    }
+
+    /**
+     * ضغط جميع الفصول المحمّلة الحالية بصيغة WebP الذكية لتوفير 40%–55% من مساحة التخزين دون فقدان ملحوظ بالجودة
+     */
+    suspend fun compressAllDownloadedChaptersToWebp(): Pair<Int, Long> = withContext(Dispatchers.IO) {
+        var compressedPagesCount = 0
+        var totalBytesSaved = 0L
+        val allWorks = dao.getAllDownloadedWorksOnce()
+        for (work in allWorks) {
+            val chapters = dao.getDownloadedChaptersForWorkOnce(work.workId)
+            for (ch in chapters) {
+                val rawPaths = localStorageManager.decodeLocalPathsJson(ch.localPagesJson)
+                if (rawPaths.isEmpty()) continue
+                var chChanged = false
+                val newPaths = rawPaths.map { path ->
+                    val f = File(path)
+                    val res = localStorageManager.compressImageFileToWebpInPlace(f)
+                    if (res != null) {
+                        compressedPagesCount++
+                        totalBytesSaved += res.second
+                        chChanged = true
+                        res.first.absolutePath
+                    } else {
+                        path
+                    }
+                }
+                if (chChanged) {
+                    val newTotalBytes = newPaths.sumOf { File(it).length() }
+                    dao.upsertDownloadedChapter(
+                        ch.copy(
+                            localPagesJson = localStorageManager.encodeLocalPathsJson(newPaths),
+                            totalBytes = newTotalBytes
+                        )
+                    )
+                }
+            }
+            val updatedWorkBytes = localStorageManager.getWorkStorageBytes(work.sourceId, work.workId)
+            dao.upsertDownloadedWork(
+                work.copy(
+                    totalStorageBytes = updatedWorkBytes,
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+        compressedPagesCount to totalBytesSaved
+    }
+
     /**
      * فحص التحديثات التلقائية في الخلفية للأعمال المفضلة وإرسال إشعار عند صدور فصل جديد
      */

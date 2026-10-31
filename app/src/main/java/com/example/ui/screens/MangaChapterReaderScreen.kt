@@ -51,14 +51,18 @@ import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDone
+import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.ScreenRotation
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -116,6 +120,7 @@ import com.example.data.MangaWork
 import com.example.data.local.DownloadedChapterEntity
 import com.example.data.preferences.UserSettings
 import com.example.ui.components.ChapterPageIllustration
+import com.example.ui.components.CloudflareProtectionDialog
 import com.example.ui.components.HiddenSiteWebViewBridge
 import com.example.ui.theme.AppDialogSurface
 import com.example.ui.theme.PeriwinkleOnPrimary
@@ -135,10 +140,13 @@ fun MangaChapterReaderScreen(
     settings: UserSettings,
     isFavorite: Boolean,
     initialPageIndex: Int = 0,
+    initialScrollOffset: Int = 0,
     liveChapterDownloadState: DownloadedChapterEntity? = null,
     diagnosticLogs: List<DiagnosticLogEntry> = emptyList(),
     onClearDiagnosticLogs: () -> Unit = {},
     onSaveReadingProgress: (Int) -> Unit = {},
+    onSaveReadingProgressWithOffset: (Int, Int) -> Unit = { page, _ -> onSaveReadingProgress(page) },
+    onOpenAlternativeSourceChapter: () -> Unit = {},
     onBackClick: () -> Unit,
     onSelectChapter: (MangaChapter) -> Unit,
     onToggleFavorite: (MangaWork) -> Unit,
@@ -194,8 +202,16 @@ fun MangaChapterReaderScreen(
     }
     var requiresCloudflare by remember(chapter.id, chapter.chapterUrl) { mutableStateOf(false) }
     var lastScrapeError by remember(chapter.id) { mutableStateOf<String?>(null) }
-    var showProtectionModal by remember { mutableStateOf(false) }
+    var showProtectionModal by remember(chapter.id, chapter.chapterUrl) { mutableStateOf(false) }
+    var hasAutoOpenedProtection by remember(chapter.id, chapter.chapterUrl) { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(requiresCloudflare, livePageUrls.size, localPagePaths.size) {
+        if (requiresCloudflare && livePageUrls.isEmpty() && localPagePaths.isEmpty() && !hasAutoOpenedProtection) {
+            hasAutoOpenedProtection = true
+            showProtectionModal = true
+        }
+    }
 
     // Only fetch from network if NOT reading a completed local chapter (100% offline support in Airplane mode!)
     LaunchedEffect(chapter.id, targetChapterUrl, isOfflineComplete, refreshTrigger) {
@@ -311,17 +327,40 @@ fun MangaChapterReaderScreen(
         }
     }
 
+    var isMagnifierActive by remember { mutableStateOf(false) }
+    var magnifierCenter by remember { mutableStateOf(Offset(540f, 800f)) }
+    var showSnapshotCropDialog by remember { mutableStateOf(false) }
+    var selectedCropRegion by remember { mutableStateOf("FULL") }
+    var isSavingSnapshot by remember { mutableStateOf(false) }
+    var autoTransitionNextChapter by remember { mutableStateOf(true) }
+
     val safeInitialPage = remember(chapter.id, initialPageIndex, totalPages) {
         initialPageIndex.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
     }
+    val safeInitialScrollOffset = remember(chapter.id, initialScrollOffset) {
+        initialScrollOffset.coerceAtLeast(0)
+    }
 
     val webtoonListState = rememberLazyListState(
-        initialFirstVisibleItemIndex = safeInitialPage
+        initialFirstVisibleItemIndex = safeInitialPage,
+        initialFirstVisibleItemScrollOffset = safeInitialScrollOffset
     )
     val pagerState = rememberPagerState(
         initialPage = safeInitialPage,
         pageCount = { totalPages }
     )
+
+    LaunchedEffect(chapter.id) {
+        if (isWebtoonMode) {
+            runCatching {
+                webtoonListState.scrollToItem(safeInitialPage, safeInitialScrollOffset)
+            }
+        } else {
+            runCatching {
+                pagerState.scrollToPage(safeInitialPage)
+            }
+        }
+    }
 
     val currentPageIndex by remember {
         derivedStateOf {
@@ -335,11 +374,26 @@ fun MangaChapterReaderScreen(
         }
     }
 
+    val currentScrollOffset by remember {
+        derivedStateOf {
+            if (isWebtoonMode) webtoonListState.firstVisibleItemScrollOffset else 0
+        }
+    }
+
     val readerContext = androidx.compose.ui.platform.LocalContext.current
 
     LaunchedEffect(currentPageIndex, isChapterLoaded) {
         if (isChapterLoaded && effectivePageCount > 0) {
             onSaveReadingProgress(currentPageIndex)
+            onSaveReadingProgressWithOffset(currentPageIndex, currentScrollOffset)
+        }
+    }
+
+    // Debounced pixel-exact scroll offset save when user pauses scrolling inside a tall webtoon strip
+    LaunchedEffect(currentScrollOffset, isChapterLoaded) {
+        if (isChapterLoaded && isWebtoonMode && effectivePageCount > 0 && currentScrollOffset > 0) {
+            delay(450L)
+            onSaveReadingProgressWithOffset(currentPageIndex, currentScrollOffset)
         }
     }
 
@@ -543,6 +597,13 @@ fun MangaChapterReaderScreen(
                             }
                         }
                     },
+                    onLongPress = { pressOffset ->
+                        magnifierCenter = pressOffset
+                        isMagnifierActive = !isMagnifierActive
+                        if (isMagnifierActive) {
+                            onShowToast("عدسة القراءة المكبّرة (2.6x) مفعّلة — اسحب العدسة أو اضغط مطولاً لإغلاقها")
+                        }
+                    },
                     onDoubleTap = { tapOffset ->
                         if (settings.webtoonZoom) {
                             val nextScale = when {
@@ -665,6 +726,43 @@ fun MangaChapterReaderScreen(
                             .padding(horizontal = 12.dp, vertical = 6.dp)
                             .testTag("reader_retry_empty_button")
                     )
+                    if (targetChapterUrl.startsWith("http")) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedButton(
+                            onClick = { showProtectionModal = true },
+                            shape = RoundedCornerShape(20.dp),
+                            border = BorderStroke(1.dp, Color(0xFFFFB74D).copy(alpha = 0.8f)),
+                            modifier = Modifier.testTag("reader_verify_site_button")
+                        ) {
+                            Text(
+                                text = "تخطي التحقق وعرض الفصل بالتطبيق 🛡️",
+                                color = Color(0xFFFFB74D),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    OutlinedButton(
+                        onClick = onOpenAlternativeSourceChapter,
+                        shape = RoundedCornerShape(20.dp),
+                        border = BorderStroke(1.dp, PeriwinklePrimary.copy(alpha = 0.6f)),
+                        modifier = Modifier.testTag("reader_fallback_alt_source_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Public,
+                            contentDescription = null,
+                            tint = PeriwinklePrimary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "فتح الفصل من مصدر بديل",
+                            color = TextPrimaryWhite,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             }
         } else {
@@ -755,8 +853,20 @@ fun MangaChapterReaderScreen(
                         )
                     }
 
-                    // End of Chapter Summary & Next/Prev Chapter Card
+                    // Seamless Infinite Chapter Transition Footer + Cross-Site Fallback
                     item(key = "chapter_footer") {
+                        LaunchedEffect(autoTransitionNextChapter, nextChapter?.id) {
+                            if (autoTransitionNextChapter && nextChapter != null && effectivePageCount > 1) {
+                                delay(1400L)
+                                // If still viewing the footer at the bottom of the chapter, seamlessly advance!
+                                val isFooterVisible = webtoonListState.layoutInfo.visibleItemsInfo.any { it.key == "chapter_footer" }
+                                if (isFooterVisible && autoTransitionNextChapter) {
+                                    onShowToast("الانتقال التلقائي إلى ${nextChapter.title}...")
+                                    onSelectChapter(nextChapter)
+                                }
+                            }
+                        }
+
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -771,6 +881,58 @@ fun MangaChapterReaderScreen(
                                 fontSize = 16.sp,
                                 fontWeight = FontWeight.Bold
                             )
+
+                            if (nextChapter != null) {
+                                Surface(
+                                    color = Color(0xFF1C2130),
+                                    shape = RoundedCornerShape(14.dp),
+                                    border = BorderStroke(1.dp, PeriwinklePrimary.copy(alpha = 0.45f)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onSelectChapter(nextChapter) }
+                                        .testTag("seamless_next_chapter_banner")
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Checkbox(
+                                                checked = autoTransitionNextChapter,
+                                                onCheckedChange = { autoTransitionNextChapter = it },
+                                                colors = CheckboxDefaults.colors(
+                                                    checkedColor = PeriwinklePrimary,
+                                                    checkmarkColor = PeriwinkleOnPrimary
+                                                ),
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "انتقال تلقائي",
+                                                color = TextSecondaryGrey,
+                                                fontSize = 11.sp
+                                            )
+                                        }
+                                        Column(horizontalAlignment = Alignment.End) {
+                                            Text(
+                                                text = "الفصل التالي جاهز للانتقال السلس ⚡",
+                                                color = PeriwinklePrimary,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Text(
+                                                text = nextChapter.title,
+                                                color = TextPrimaryWhite,
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+                                }
+                            }
 
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -803,6 +965,25 @@ fun MangaChapterReaderScreen(
                                         Text(nextLabel, fontWeight = FontWeight.Bold)
                                     }
                                 }
+                            }
+
+                            TextButton(
+                                onClick = onOpenAlternativeSourceChapter,
+                                modifier = Modifier.testTag("footer_alt_source_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Public,
+                                    contentDescription = null,
+                                    tint = PeriwinklePrimary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "فتح هذا الفصل من مصدر عربي بديل",
+                                    color = PeriwinklePrimary,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
                             }
                         }
                     }
@@ -1073,6 +1254,37 @@ fun MangaChapterReaderScreen(
                         )
                     }
 
+                    // Magnifier Loupe Quick Toggle Button ("عدسة القراءة المكبرة")
+                    IconButton(
+                        onClick = {
+                            isMagnifierActive = !isMagnifierActive
+                            if (isMagnifierActive) {
+                                onShowToast("تم تفعيل عدسة القراءة السريعة (2.6x) — يمكنك أيضاً الضغط المطوّل على أي نص")
+                            }
+                        },
+                        modifier = Modifier.testTag("reader_magnifier_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ZoomIn,
+                            contentDescription = "عدسة القراءة المكبرة",
+                            tint = if (isMagnifierActive) PeriwinklePrimary else TextPrimaryWhite,
+                            modifier = Modifier.size(21.dp)
+                        )
+                    }
+
+                    // Panel Snapshot & Crop Button ("لقطة وقص مشهد")
+                    IconButton(
+                        onClick = { showSnapshotCropDialog = true },
+                        modifier = Modifier.testTag("reader_snapshot_crop_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Crop,
+                            contentDescription = "لقطة وقص مشهد",
+                            tint = TextPrimaryWhite,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
                     // Chapters Switcher Button ("قائمة الفصول")
                     IconButton(
                         onClick = { showChaptersListSheet = true },
@@ -1096,6 +1308,100 @@ fun MangaChapterReaderScreen(
                             contentDescription = "الانتقال بين الصفحات",
                             tint = TextPrimaryWhite,
                             modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        // ==================== MAGNIFIER LOUPE OVERLAY (عدسة القراءة السريعة بالضغط المطول) ====================
+        AnimatedVisibility(
+            visible = isMagnifierActive && isChapterLoaded && effectivePageCount > 0,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 64.dp, start = 16.dp, end = 16.dp)
+        ) {
+            Surface(
+                color = Color(0xF5141824),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(2.dp, PeriwinklePrimary),
+                tonalElevation = 12.dp,
+                shadowElevation = 14.dp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(235.dp)
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            do {
+                                val event = awaitPointerEvent()
+                                val pan = event.calculatePan()
+                                if (pan != Offset.Zero) {
+                                    magnifierCenter = Offset(
+                                        x = (magnifierCenter.x - pan.x * 1.6f).coerceIn(0f, 1080f),
+                                        y = (magnifierCenter.y - pan.y * 1.6f).coerceIn(0f, 2200f)
+                                    )
+                                    event.changes.forEach { it.consume() }
+                                }
+                            } while (event.changes.any { it.pressed })
+                        }
+                    }
+                    .testTag("reader_magnifier_loupe_overlay")
+            ) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    val normX = ((magnifierCenter.x / 1080f) - 0.5f).coerceIn(-0.45f, 0.45f)
+                    val normY = ((magnifierCenter.y / 1920f) - 0.5f).coerceIn(-0.45f, 0.45f)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(20.dp))
+                            .graphicsLayer(
+                                scaleX = 2.6f,
+                                scaleY = 2.6f,
+                                translationX = -normX * 520f,
+                                translationY = -normY * 420f
+                            )
+                    ) {
+                        ChapterPageIllustration(
+                            work = work,
+                            chapterNumber = chapter.number,
+                            pageIndex = currentPageIndex,
+                            totalPages = effectivePageCount,
+                            pageImageUrl = livePageUrls.getOrNull(currentPageIndex),
+                            localFilePath = localPagePaths.getOrNull(currentPageIndex),
+                            refererUrl = targetChapterUrl,
+                            autoCropBorders = localAutoCrop,
+                            colorFilterMode = localColorFilter,
+                            splitLongStrip = false
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .fillMaxWidth()
+                            .background(Color(0xCC0D1017))
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(
+                            onClick = { isMagnifierActive = false },
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "إغلاق العدسة",
+                                tint = Color(0xFFFF8A80),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        Text(
+                            text = "عدسة القراءة المكبّرة 2.6x • اسحب لتحريك العدسة على النص",
+                            color = PeriwinklePrimary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
                         )
                     }
                 }
@@ -2097,6 +2403,198 @@ fun MangaChapterReaderScreen(
                 TextButton(onClick = { showPagesGridDialog = false }) {
                     Text("إغلاق", color = PeriwinklePrimary)
                 }
+            }
+        )
+    }
+
+    // Panel Snapshot & Crop Dialog ("لقطة أو قص مشهد من الفصل ومشاركته")
+    if (showSnapshotCropDialog) {
+        fun captureAndProcessSnapshot(shareNow: Boolean) {
+            if (isSavingSnapshot) return
+            isSavingSnapshot = true
+            scope.launch {
+                val savedFile = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching {
+                        val localPath = localPagePaths.getOrNull(currentPageIndex)
+                        val remoteUrl = livePageUrls.getOrNull(currentPageIndex)
+                        var bitmap: android.graphics.Bitmap? = null
+                        if (!localPath.isNullOrBlank() && java.io.File(localPath).exists()) {
+                            bitmap = android.graphics.BitmapFactory.decodeFile(localPath)
+                        } else if (!remoteUrl.isNullOrBlank() && remoteUrl.startsWith("http")) {
+                            val loader = com.example.ui.components.MangaCoilImageLoader.get(readerContext)
+                            val req = coil.request.ImageRequest.Builder(readerContext)
+                                .data(remoteUrl)
+                                .allowHardware(false)
+                                .setHeader("Referer", targetChapterUrl.ifBlank { work.siteUrl })
+                                .setHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent.replace("; wv", ""))
+                                .build()
+                            val res = loader.execute(req)
+                            val drawable = res.drawable
+                            if (drawable is android.graphics.drawable.BitmapDrawable) {
+                                bitmap = drawable.bitmap
+                            }
+                        }
+                        if (bitmap != null) {
+                            com.example.data.storage.LocalStorageManager(readerContext).cropAndSavePanelSnapshot(
+                                bitmap = bitmap,
+                                workTitle = work.title,
+                                chapterNumber = chapter.number,
+                                pageIndex = currentPageIndex,
+                                cropRegion = selectedCropRegion
+                            )
+                        } else {
+                            null
+                        }
+                    }.getOrNull()
+                }
+                isSavingSnapshot = false
+                showSnapshotCropDialog = false
+                if (savedFile != null) {
+                    onShowToast("تم حفظ اللقطة بجودة أصلية في معرض الصور (${savedFile.name})")
+                    if (shareNow) {
+                        runCatching {
+                            val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(
+                                    android.content.Intent.EXTRA_TEXT,
+                                    "مشهد من ${work.title} - ${chapter.title} (صفحة ${currentPageIndex + 1})\nمحفوظ في المعرض: ${savedFile.name}"
+                                )
+                            }
+                            readerContext.startActivity(
+                                android.content.Intent.createChooser(sendIntent, "مشاركة لقطة الفصل")
+                            )
+                        }
+                    }
+                } else {
+                    onShowToast("تعذر التقاط الصفحة الحالية — تأكد من اكتمال تحميل الصفحة")
+                }
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = { showSnapshotCropDialog = false },
+            containerColor = AppDialogSurface,
+            title = {
+                Text(
+                    text = "لقطة وقص مشهد (صفحة ${currentPageIndex + 1})",
+                    color = TextPrimaryWhite,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "اختر الجزء المراد قصه وحفظه بجودة أصلية في معرض الصور أو مشاركته مباشرة:",
+                        color = TextSecondaryGrey,
+                        fontSize = 12.sp
+                    )
+                    val cropOptions = listOf(
+                        "FULL" to "كامل الصفحة الحالية (جودة أصلية)",
+                        "TOP" to "المشهد العلوي من الصفحة",
+                        "MIDDLE" to "المشهد الأوسط (التركيز الدرامي)",
+                        "BOTTOM" to "المشهد السفلي من الصفحة"
+                    )
+                    cropOptions.forEach { (key, label) ->
+                        val isSel = selectedCropRegion == key
+                        Surface(
+                            color = if (isSel) PeriwinklePrimary.copy(alpha = 0.22f) else Color(0xFF232734),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, if (isSel) PeriwinklePrimary else Color(0xFF394054)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedCropRegion = key }
+                                .testTag("snapshot_crop_option_$key")
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                if (isSel) {
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircle,
+                                        contentDescription = null,
+                                        tint = PeriwinklePrimary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                } else {
+                                    Spacer(modifier = Modifier.size(18.dp))
+                                }
+                                Text(
+                                    text = label,
+                                    color = if (isSel) PeriwinklePrimary else TextPrimaryWhite,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = { captureAndProcessSnapshot(shareNow = true) },
+                        enabled = !isSavingSnapshot,
+                        modifier = Modifier.testTag("snapshot_share_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = null,
+                            tint = PeriwinklePrimary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("قص ومشاركة", color = PeriwinklePrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Button(
+                        onClick = { captureAndProcessSnapshot(shareNow = false) },
+                        enabled = !isSavingSnapshot,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = PeriwinklePrimary,
+                            contentColor = PeriwinkleOnPrimary
+                        ),
+                        modifier = Modifier.testTag("snapshot_save_gallery_button")
+                    ) {
+                        Text(
+                            text = if (isSavingSnapshot) "جارٍ الحفظ..." else "حفظ في المعرض",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSnapshotCropDialog = false }) {
+                    Text("إلغاء", color = TextSecondaryGrey)
+                }
+            }
+        )
+    }
+
+    if (showProtectionModal && targetChapterUrl.startsWith("http")) {
+        CloudflareProtectionDialog(
+            url = targetChapterUrl,
+            siteName = work.siteName.ifBlank { "الموقع" },
+            jsExtractorScript = LiveMangaSiteScraper.JS_EXTRACT_CHAPTER_PAGES,
+            onExtractedDomJson = { rawJson ->
+                val domRes = LiveMangaSiteScraper.parseChapterPagesFromDomJson(rawJson, targetChapterUrl)
+                if (domRes.pageUrls.isNotEmpty()) {
+                    livePageUrls = domRes.pageUrls
+                    LiveMangaSiteScraper.cacheChapterPages(targetChapterUrl, domRes.pageUrls)
+                    requiresCloudflare = false
+                    lastScrapeError = null
+                    loadingProgress = 100
+                    isChapterLoaded = true
+                }
+            },
+            onDismissAndRefresh = {
+                showProtectionModal = false
+                refreshTrigger++
+                onShowToast("تم تخطي التحقق وعرض صفحات الفصل داخل القارئ")
             }
         )
     }

@@ -690,6 +690,101 @@ class LocalStorageManager(private val context: Context) {
         }
     }
 
+    /**
+     * يضغط ملف صورة فصل حالي (JPG/PNG) إلى صيغة WebP الذكية بجودة 80% لتوفير 40%–55% من مساحة التخزين
+     */
+    fun compressImageFileToWebpInPlace(file: File): Pair<File, Long>? {
+        if (!file.exists() || !file.isFile || file.extension.equals("webp", ignoreCase = true)) return null
+        val oldSize = file.length()
+        if (oldSize < 1024L) return null
+        return try {
+            val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return null
+            val webpFile = File(file.parentFile, "${file.nameWithoutExtension}.webp")
+            val format = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                Bitmap.CompressFormat.WEBP_LOSSY
+            } else {
+                @Suppress("DEPRECATION")
+                Bitmap.CompressFormat.WEBP
+            }
+            webpFile.outputStream().buffered().use { out ->
+                bitmap.compress(format, 80, out)
+            }
+            if (webpFile.exists() && webpFile.length() in 128L until oldSize) {
+                val savedBytes = (oldSize - webpFile.length()).coerceAtLeast(0L)
+                if (webpFile.absolutePath != file.absolutePath) {
+                    file.delete()
+                }
+                webpFile to savedBytes
+            } else {
+                if (webpFile.exists() && webpFile.absolutePath != file.absolutePath) {
+                    webpFile.delete()
+                }
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * يلتقط أو يقص مشهداً من صفحة الفصل الحالية ويحفظه في معرض الصور (MediaStore) ومجلد اللقطات
+     */
+    fun cropAndSavePanelSnapshot(
+        bitmap: Bitmap,
+        workTitle: String,
+        chapterNumber: Int,
+        pageIndex: Int,
+        cropRegion: String = "FULL"
+    ): File? {
+        return try {
+            val w = bitmap.width.coerceAtLeast(1)
+            val h = bitmap.height.coerceAtLeast(1)
+            val cropped = when (cropRegion) {
+                "TOP" -> Bitmap.createBitmap(bitmap, 0, 0, w, (h * 0.42f).toInt().coerceIn(1, h))
+                "MIDDLE" -> {
+                    val startY = (h * 0.28f).toInt().coerceIn(0, h - 1)
+                    val sliceH = (h * 0.44f).toInt().coerceIn(1, h - startY)
+                    Bitmap.createBitmap(bitmap, 0, startY, w, sliceH)
+                }
+                "BOTTOM" -> {
+                    val startY = (h * 0.56f).toInt().coerceIn(0, h - 1)
+                    val sliceH = (h - startY).coerceAtLeast(1)
+                    Bitmap.createBitmap(bitmap, 0, startY, w, sliceH)
+                }
+                else -> bitmap
+            }
+            val snapDir = File(getRootSavedDir(), "snapshots").apply { if (!exists()) mkdirs() }
+            val safeWork = sanitizeSegment(workTitle).take(32)
+            val fileName = "${safeWork}_ch${chapterNumber}_p${pageIndex + 1}_${cropRegion.lowercase()}.jpg"
+            val snapFile = File(snapDir, fileName)
+            snapFile.outputStream().buffered().use { out ->
+                cropped.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            }
+            // Also insert into Android MediaStore Pictures so it appears immediately in the user's Gallery
+            runCatching {
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                    put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MangaBrowser")
+                    }
+                }
+                val uri = context.contentResolver.insert(
+                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    values
+                )
+                if (uri != null) {
+                    context.contentResolver.openOutputStream(uri)?.use { galleryOut ->
+                        snapFile.inputStream().use { it.copyTo(galleryOut) }
+                    }
+                }
+            }
+            if (snapFile.exists() && snapFile.length() > 64L) snapFile else null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     companion object {
         fun sanitizeSegment(raw: String): String {
             return raw.replace(Regex("[^a-zA-Z0-9_\\-\u0600-\u06FF]"), "_")

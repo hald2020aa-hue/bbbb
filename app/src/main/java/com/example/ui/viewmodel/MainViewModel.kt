@@ -40,6 +40,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.withContext
 import java.text.DecimalFormat
 
 enum class AppScreen {
@@ -635,6 +636,7 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
             }
 
             val resumePage = effectiveChapter.lastReadPage.takeIf { it >= 0 } ?: 0
+            val resumeScrollOffset = savedProgress?.scrollOffset ?: 0
             repository.readingProgressRepository.saveProgress(
                 workId = work.id,
                 workTitle = work.title,
@@ -643,7 +645,7 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
                 chapterTitle = effectiveChapter.title,
                 pageIndex = resumePage,
                 totalPages = effectiveChapter.pageCount,
-                scrollOffset = 0
+                scrollOffset = resumeScrollOffset
             )
 
             recordPageVisit(
@@ -1749,13 +1751,13 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
         openMangaChapterReader(work, chapter)
     }
 
-    // Backup & Restore
+    // Backup & Restore + Smart WebP Compression + Batch Read + Cross-Site Chapter Fallback
     fun createBackup() {
         viewModelScope.launch {
             try {
                 repository.exportBackupJson()
                 refreshStorageStats()
-                showToast("تم حفظ النسخة الاحتياطية في التخزين")
+                showToast("تم حفظ النسخة الاحتياطية الكاملة (JSON) في التخزين")
             } catch (e: Exception) {
                 showToast("فشل إنشاء النسخة الاحتياطية")
             }
@@ -1767,11 +1769,120 @@ class MainViewModel(val repository: AppRepository) : ViewModel() {
             try {
                 val count = repository.restoreBackupFromDefaultFile()
                 showToast(
-                    if (count > 0) "تمت استعادة $count موقع من النسخة الاحتياطية"
+                    if (count > 0) "تمت استعادة $count عنصر من النسخة الاحتياطية بنجاح"
                     else "تم فحص النسخة الاحتياطية (لا توجد بيانات جديدة)"
                 )
             } catch (e: Exception) {
                 showToast("لا توجد نسخة احتياطية محفوظة للاستعادة")
+            }
+        }
+    }
+
+    fun exportBackupToUri(uri: Uri) {
+        viewModelScope.launch {
+            val ok = repository.exportBackupJsonToUri(uri)
+            refreshStorageStats()
+            showToast(if (ok) "تم تصدير النسخة الاحتياطية الكاملة (JSON) بنجاح" else "تعذر تصدير ملف النسخة الاحتياطية")
+        }
+    }
+
+    fun importBackupFromUri(uri: Uri) {
+        viewModelScope.launch {
+            val count = repository.restoreBackupFromUri(uri)
+            refreshStorageStats()
+            showToast(
+                if (count > 0) "تمت استعادة $count عنصر (مواقع، مفضلة، وتقدم قراءة) بنجاح"
+                else "تم قراءة ملف النسخة الاحتياطية بنجاح"
+            )
+        }
+    }
+
+    fun compressAllDownloadedChaptersToWebp() {
+        viewModelScope.launch {
+            showToast("جارٍ ضغط الفصول المحمّلة بصيغة WebP الذكية لتوفير المساحة...")
+            val (compressedCount, savedBytes) = repository.compressAllDownloadedChaptersToWebp()
+            refreshStorageStats()
+            if (compressedCount > 0) {
+                val savedFormatted = formatBytesArabic(savedBytes)
+                showToast("تم ضغط $compressedCount صفحة بصيغة WebP وتوفير $savedFormatted بنجاح!")
+            } else {
+                showToast("جميع الفصول المحمّلة مضغوطة بالفعل بأفضل حجم (WebP)")
+            }
+        }
+    }
+
+    fun markChaptersReadBatch(work: MangaWork, chapterNumbers: List<Int>, markAsRead: Boolean = true) {
+        if (chapterNumbers.isEmpty()) return
+        val currentReadMap = _readChaptersMap.value.toMutableMap()
+        val readSet = currentReadMap[work.id]?.toMutableSet() ?: mutableSetOf()
+        if (markAsRead) {
+            readSet.addAll(chapterNumbers)
+        } else {
+            readSet.removeAll(chapterNumbers.toSet())
+        }
+        currentReadMap[work.id] = readSet
+        _readChaptersMap.value = currentReadMap
+
+        if (markAsRead) {
+            val maxCh = chapterNumbers.maxOrNull() ?: 1
+            val currentProgressMap = _readingProgressMap.value.toMutableMap()
+            currentProgressMap[work.id] = maxCh to 0
+            _readingProgressMap.value = currentProgressMap
+            viewModelScope.launch {
+                for (chNum in chapterNumbers) {
+                    val chObj = work.chapters.find { it.number == chNum }
+                    repository.readingProgressRepository.saveProgress(
+                        workId = work.id,
+                        workTitle = work.title,
+                        chapterId = chObj?.id ?: "ch-$chNum",
+                        chapterNumber = chNum,
+                        chapterTitle = chObj?.title ?: "الفصل $chNum",
+                        pageIndex = (chObj?.pageCount ?: 12).coerceAtLeast(1) - 1,
+                        totalPages = (chObj?.pageCount ?: 12).coerceAtLeast(1),
+                        scrollOffset = 0
+                    )
+                }
+                showToast("تم تحديد ${chapterNumbers.size} فصل كمقروء")
+            }
+        } else {
+            showToast("تم إلغاء تحديد ${chapterNumbers.size} فصل كمقروء")
+        }
+    }
+
+    fun openChapterFromAlternativeSite(work: MangaWork, chapterNumber: Int) {
+        viewModelScope.launch {
+            showToast("جارٍ البحث عن الفصل $chapterNumber من «${work.title}» في المصادر العربية البديلة...")
+            val query = work.title.trim()
+            val otherSites = enabledSites.value.filter { it.id != work.sourceId && it.name != work.siteName }
+            val targetSites = if (otherSites.isNotEmpty()) otherSites else enabledSites.value
+            var foundAltWork: MangaWork? = null
+            var foundAltChapter: MangaChapter? = null
+
+            withContext(Dispatchers.IO) {
+                for (site in targetSites) {
+                    val searchRes = runCatching {
+                        LiveMangaSiteScraper.fetchSiteCatalog(site = site, searchQuery = query)
+                    }.getOrNull()
+                    val candidate = searchRes?.works?.firstOrNull { it.mangaUrl != work.mangaUrl } ?: continue
+                    val detailsRes = runCatching {
+                        LiveMangaSiteScraper.fetchMangaDetails(candidate)
+                    }.getOrNull()
+                    val enriched = detailsRes?.work ?: candidate
+                    val targetCh = enriched.chapters.find { it.number == chapterNumber }
+                        ?: enriched.chapters.minByOrNull { kotlin.math.abs(it.number - chapterNumber) }
+                    if (targetCh != null) {
+                        foundAltWork = enriched
+                        foundAltChapter = targetCh
+                        break
+                    }
+                }
+            }
+
+            if (foundAltWork != null && foundAltChapter != null) {
+                showToast("تم العثور على ${foundAltChapter!!.title} في مصدر بديل (${foundAltWork!!.siteName})!")
+                openMangaChapterReader(foundAltWork!!, foundAltChapter!!)
+            } else {
+                showToast("لم يتم العثور على الفصل $chapterNumber في المصادر البديلة المفعّلة حالياً")
             }
         }
     }

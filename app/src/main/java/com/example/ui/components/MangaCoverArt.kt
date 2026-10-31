@@ -1167,9 +1167,9 @@ fun HiddenSiteWebViewBridge(
 }
 
 /**
- * Interactive Cloudflare Protection & Live Site Verification Modal ("الحماية").
- * Lets the user solve Cloudflare challenges or inspect the live site connection, automatically syncing cookies
- * and extracting the rendered DOM back into the native app UI.
+ * Interactive Cloudflare Protection & Live Site Verification Modal ("صفحة التحقق اليدوي").
+ * Lets the user manually bypass Cloudflare / anti-bot challenges, unifies User-Agent & Cookies
+ * with OkHttp/Coil, and automatically extracts & displays the manga natively inside the app as soon as verification completes.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -1181,7 +1181,53 @@ fun CloudflareProtectionDialog(
     onDismissAndRefresh: () -> Unit
 ) {
     var isLoadingPage by remember { mutableStateOf(true) }
+    var isVerifiedSuccess by remember { mutableStateOf(false) }
+    var statusBannerText by remember {
+        mutableStateOf("أكمل التحقق البشري في الصفحة أدناه ليتم عرض المانجا تلقائياً داخل التطبيق")
+    }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+
+    // Continuously poll the live WebView DOM while the verification page is open so that
+    // as soon as the user passes the verification challenge, the manga is extracted and shown natively!
+    LaunchedEffect(webViewInstance, jsExtractorScript, isVerifiedSuccess) {
+        val view = webViewInstance ?: return@LaunchedEffect
+        val script = jsExtractorScript ?: return@LaunchedEffect
+        while (!isVerifiedSuccess) {
+            kotlinx.coroutines.delay(1200L)
+            try {
+                CookieManager.getInstance().flush()
+                view.evaluateJavascript(
+                    "(function(){ try { var btns = document.querySelectorAll('.chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters'); for(var i=0;i<btns.length;i++){ if(btns[i].click) btns[i].click(); } } catch(e){} })();",
+                    null
+                )
+                view.evaluateJavascript(script) { rawJson ->
+                    if (!rawJson.isNullOrBlank() && rawJson != "null" && !isVerifiedSuccess) {
+                        val hasRealContent = rawJson.contains("\"items\":[{") ||
+                            rawJson.contains("\"chapters\":[{") ||
+                            rawJson.contains("\"galleryPages\":[\"") ||
+                            rawJson.contains("\"pages\":[\"") ||
+                            rawJson.contains("\"updates\":[{")
+                        val isStillChallenge = rawJson.contains("\"cf\":true")
+                        if (hasRealContent && !isStillChallenge) {
+                            CookieManager.getInstance().flush()
+                            onExtractedDomJson?.invoke(rawJson)
+                            statusBannerText = "تم التحقق بنجاح! جارٍ عرض المانجا داخل التطبيق..."
+                            isVerifiedSuccess = true
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    LaunchedEffect(isVerifiedSuccess) {
+        if (isVerifiedSuccess) {
+            kotlinx.coroutines.delay(450L)
+            CookieManager.getInstance().flush()
+            onDismissAndRefresh()
+        }
+    }
 
     Dialog(
         onDismissRequest = onDismissAndRefresh,
@@ -1190,7 +1236,7 @@ fun CloudflareProtectionDialog(
         Surface(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(12.dp),
+                .padding(10.dp),
             shape = RoundedCornerShape(18.dp),
             color = AppDialogSurface
         ) {
@@ -1204,25 +1250,27 @@ fun CloudflareProtectionDialog(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                         Icon(
                             imageVector = Icons.Default.Security,
                             contentDescription = null,
-                            tint = PeriwinklePrimary,
+                            tint = if (isVerifiedSuccess) Color(0xFF81C784) else PeriwinklePrimary,
                             modifier = Modifier.size(22.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Column {
                             Text(
-                                text = "حماية الموقع وتخطي Cloudflare",
+                                text = "التحقق من الموقع وعرض المانجا بالتطبيق",
                                 color = TextPrimaryWhite,
-                                fontSize = 14.sp,
+                                fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = siteName,
-                                color = TextSecondaryGrey,
-                                fontSize = 11.sp
+                                text = statusBannerText,
+                                color = if (isVerifiedSuccess) Color(0xFF81C784) else TextSecondaryGrey,
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -1237,7 +1285,7 @@ fun CloudflareProtectionDialog(
                     }
                 }
 
-                // Live WebView for solving Cloudflare / loading session cookies
+                // Live WebView for solving Cloudflare / Turnstile / CAPTCHA and syncing session cookies
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -1253,12 +1301,19 @@ fun CloudflareProtectionDialog(
 
                                 settings.javaScriptEnabled = true
                                 settings.domStorageEnabled = true
+                                settings.databaseEnabled = true
+                                settings.javaScriptCanOpenWindowsAutomatically = true
                                 settings.allowFileAccess = false
                                 settings.allowContentAccess = false
                                 settings.useWideViewPort = true
                                 settings.loadWithOverviewMode = true
-                                LiveMangaSiteScraper.activeUserAgent =
-                                    settings.userAgentString ?: LiveMangaSiteScraper.DEFAULT_USER_AGENT
+                                settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+
+                                // Unify User-Agent (strip "; wv") so cf_clearance cookies work in OkHttp and Coil!
+                                val cleanUa = (settings.userAgentString ?: LiveMangaSiteScraper.DEFAULT_USER_AGENT)
+                                    .replace("; wv", "")
+                                settings.userAgentString = cleanUa
+                                LiveMangaSiteScraper.activeUserAgent = cleanUa
 
                                 webChromeClient = WebChromeClient()
                                 webViewClient = object : WebViewClient() {
@@ -1277,11 +1332,21 @@ fun CloudflareProtectionDialog(
                                                     view.evaluateJavascript(jsExtractorScript) { rawJson ->
                                                         if (!rawJson.isNullOrBlank() && rawJson != "null") {
                                                             onExtractedDomJson(rawJson)
+                                                            val hasRealContent = rawJson.contains("\"items\":[{") ||
+                                                                rawJson.contains("\"chapters\":[{") ||
+                                                                rawJson.contains("\"galleryPages\":[\"") ||
+                                                                rawJson.contains("\"pages\":[\"") ||
+                                                                rawJson.contains("\"updates\":[{")
+                                                            val isStillChallenge = rawJson.contains("\"cf\":true")
+                                                            if (hasRealContent && !isStillChallenge) {
+                                                                statusBannerText = "تم التحقق بنجاح! جارٍ عرض المانجا داخل التطبيق..."
+                                                                isVerifiedSuccess = true
+                                                            }
                                                         }
                                                     }
                                                 } catch (_: Exception) {
                                                 }
-                                            }, 700L)
+                                            }, 650L)
                                         }
                                     }
                                 }
@@ -1330,9 +1395,14 @@ fun CloudflareProtectionDialog(
                             containerColor = PeriwinklePrimary,
                             contentColor = PeriwinkleOnPrimary
                         ),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("cloudflare_confirm_return_button")
                     ) {
-                        Text("تم التحقق — عرض المانجا داخل التطبيق", fontWeight = FontWeight.Bold)
+                        Text(
+                            text = "تم تخطي التحقق — عرض المانجا داخل التطبيق الآن",
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }
